@@ -1,0 +1,1 @@
+{"$schema":"https://railway.com/railway.schema.json","build":{"builder":"NIXPACKS","buildCommand":"pnpm install --frozen-lockfile=false && pnpm --filter @stockos/api build"},"deploy":{"startCommand":"node apps/api/dist/apps/api/src/index.js","healthcheckPath":"/health","restartPolicyType":"ON_FAILURE"}}
