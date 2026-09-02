@@ -4,11 +4,15 @@
   "type": "module",
   "version": "0.1.0",
   "packageManager": "pnpm@10.15.0",
-  "workspaces": ["apps/*", "packages/*"],
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
     "test:core": "node --experimental-strip-types tests/core.test.ts",
     "dev:web": "pnpm --filter @stockos/web dev",
     "dev:api": "pnpm --filter @stockos/api dev",
-    "build": "pnpm -r build"
+    "build": "pnpm --filter @stockos/web build",
+    "typecheck": "pnpm --filter @stockos/api typecheck && pnpm --filter @stockos/worker typecheck"
   }
 }
