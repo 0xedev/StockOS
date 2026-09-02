@@ -9,9 +9,11 @@ export function getCdpClient(): CdpClient {
   if (!apiKeyId || !apiKeySecret) {
     throw new Error("CDP_API_KEY_ID and CDP_API_KEY_SECRET must be configured");
   }
-  const options: Record<string, string> = { apiKeyId, apiKeySecret };
-  if (process.env.CDP_WALLET_SECRET) options.walletSecret = process.env.CDP_WALLET_SECRET;
-  client = new CdpClient(options);
+  client = new CdpClient({
+    apiKeyId,
+    apiKeySecret,
+    ...(process.env.CDP_WALLET_SECRET ? { walletSecret: process.env.CDP_WALLET_SECRET } : {}),
+  });
   return client;
 }
 
