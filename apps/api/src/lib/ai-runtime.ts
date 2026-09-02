@@ -2,7 +2,6 @@ import { decryptByok, encryptByok, maskSecret, type EncryptedSecret } from "../.
 import { getAdminSupabase } from "./db.ts";
 
 const DEFAULT_MODEL = "openai/gpt-5.6-luna";
-
 type AiRuntime = { apiKey: string | null; model: string; source: "managed" | "byok" | "demo" };
 
 function masterKey(): string {
@@ -10,18 +9,16 @@ function masterKey(): string {
   return process.env.BYOK_MASTER_KEY;
 }
 
+async function verifyOpenRouterKey(apiKey: string) {
+  const response = await fetch("https://openrouter.ai/api/v1/key", { headers: { Authorization: `Bearer ${apiKey}` } });
+  if (!response.ok) throw new Error("OpenRouter rejected this API key");
+  return response.json();
+}
+
 export async function getAiSettings(userId: string) {
   const db = getAdminSupabase();
   const { data: preference } = await db.from("ai_preferences").select("provider,model").eq("user_id", userId).maybeSingle();
-  const { data: credential } = await db
-    .from("ai_credentials")
-    .select("id,provider,model_preference,masked_hint,last_verified_at,created_at")
-    .eq("user_id", userId)
-    .eq("provider", "openrouter_byok")
-    .is("revoked_at", null)
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
+  const { data: credential } = await db.from("ai_credentials").select("id,provider,model_preference,masked_hint,last_verified_at,created_at").eq("user_id", userId).eq("provider", "openrouter_byok").is("revoked_at", null).order("created_at", { ascending: false }).limit(1).maybeSingle();
   return {
     provider: preference?.provider ?? "managed_openrouter",
     model: preference?.model ?? credential?.model_preference ?? DEFAULT_MODEL,
@@ -30,9 +27,11 @@ export async function getAiSettings(userId: string) {
 }
 
 export async function saveOpenRouterByok(userId: string, apiKey: string, model = DEFAULT_MODEL) {
-  if (!apiKey.trim()) throw new Error("API key is required");
+  const normalized = apiKey.trim();
+  if (!normalized) throw new Error("API key is required");
+  await verifyOpenRouterKey(normalized);
   const db = getAdminSupabase();
-  const encrypted = encryptByok(apiKey.trim(), masterKey());
+  const encrypted = encryptByok(normalized, masterKey());
   const now = new Date().toISOString();
   await db.from("ai_credentials").update({ revoked_at: now }).eq("user_id", userId).eq("provider", "openrouter_byok").is("revoked_at", null);
   const { error: insertError } = await db.from("ai_credentials").insert({
@@ -41,7 +40,7 @@ export async function saveOpenRouterByok(userId: string, apiKey: string, model =
     encrypted_secret: JSON.stringify(encrypted),
     key_version: "aes-256-gcm-v1",
     model_preference: model,
-    masked_hint: maskSecret(apiKey.trim()),
+    masked_hint: maskSecret(normalized),
     last_verified_at: now,
   });
   if (insertError) throw new Error(`Could not store BYOK credential: ${insertError.message}`);
@@ -63,15 +62,7 @@ export async function resolveAiRuntime(userId: string): Promise<AiRuntime> {
   const { data: preference } = await db.from("ai_preferences").select("provider,model").eq("user_id", userId).maybeSingle();
   const model = preference?.model ?? process.env.OPENROUTER_MODEL ?? DEFAULT_MODEL;
   if (preference?.provider === "openrouter_byok") {
-    const { data: credential, error } = await db
-      .from("ai_credentials")
-      .select("encrypted_secret,model_preference")
-      .eq("user_id", userId)
-      .eq("provider", "openrouter_byok")
-      .is("revoked_at", null)
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    const { data: credential, error } = await db.from("ai_credentials").select("encrypted_secret,model_preference").eq("user_id", userId).eq("provider", "openrouter_byok").is("revoked_at", null).order("created_at", { ascending: false }).limit(1).maybeSingle();
     if (error || !credential) throw new Error("BYOK is selected but no active OpenRouter key exists");
     const payload = JSON.parse(credential.encrypted_secret) as EncryptedSecret;
     return { apiKey: decryptByok(payload, masterKey()), model: credential.model_preference ?? model, source: "byok" };
