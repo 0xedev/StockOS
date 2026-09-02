@@ -8,7 +8,9 @@
     "start": "tsx src/index.ts"
   },
   "dependencies": {
+    "@coinbase/cdp-sdk": "latest",
     "@fastify/cors": "latest",
+    "@supabase/supabase-js": "latest",
     "fastify": "latest"
   },
   "devDependencies": {
