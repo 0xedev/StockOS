@@ -8,6 +8,9 @@
     "apps/*",
     "packages/*"
   ],
+  "dependencies": {
+    "viem": "latest"
+  },
   "scripts": {
     "test:core": "node --experimental-strip-types tests/core.test.ts",
     "dev:web": "pnpm --filter @stockos/web dev",
