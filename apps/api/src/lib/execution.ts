@@ -3,7 +3,7 @@ import { formatUnits, isAddress } from "viem";
 import { ASSETS } from "../../../../packages/b20/src/registry.ts";
 import type { CompiledStrategy, InvestmentIntent, SupportedAsset } from "../../../../packages/core/src/types.ts";
 import { ZeroXClient, type ZeroXSwapResponse } from "../../../../packages/execution/src/zerox.ts";
-import { encodeExactApproval, readAllowance, readReferencePrice, readTokenBalance, readTokenDecimals } from "./chain.ts";
+import { encodeExactApproval, readAllowance, readB20ReceiveSafety, readReferencePrice, readTokenBalance, readTokenDecimals } from "./chain.ts";
 import { getAdminSupabase } from "./db.ts";
 import { loadOwnedStrategyVersion } from "./strategy-store.ts";
 
@@ -25,6 +25,7 @@ type PriceWork = {
   tokenAddress: string;
   response: ZeroXSwapResponse;
   allowanceTarget: string;
+  b20Safety: { transferPaused: boolean; receiverPolicyId: bigint; receiverAuthorized: boolean };
 };
 
 function usdcRaw(amountUsd: number): bigint {
@@ -98,7 +99,6 @@ export async function prepareExecution(input: { userId: string; smartAccountAddr
   if (!process.env.ZEROX_API_KEY) throw new ExecutionPreparationError("zerox_not_configured", "0x is not configured", 503);
   const { version, strategy } = await loadOwnedStrategyVersion(input.userId, input.strategyVersionId);
   const compiled = version.compiled_strategy as CompiledStrategy;
-  const intent = version.parsed_intent as InvestmentIntent;
   const stockAllocations = compiled.allocations.filter(allocation => allocation.asset !== "USDC" && allocation.amountUsd > 0);
   if (!stockAllocations.length) throw new ExecutionPreparationError("nothing_to_execute", "Strategy has no stock allocations");
 
@@ -107,10 +107,19 @@ export async function prepareExecution(input: { userId: string; smartAccountAddr
   for (const allocation of stockAllocations) {
     const record = ASSETS[allocation.asset];
     if (!record?.enabled || !record.address) throw new ExecutionPreparationError("asset_not_verified", `${allocation.asset} is not enabled for execution`, 409);
+
+    const b20Safety = await readB20ReceiveSafety(record.address, input.smartAccountAddress);
+    if (b20Safety.transferPaused) {
+      throw new ExecutionPreparationError("b20_transfer_paused", `${allocation.asset} transfers are currently paused by the issuer`, 409);
+    }
+    if (!b20Safety.receiverAuthorized) {
+      throw new ExecutionPreparationError("b20_receiver_not_authorized", `This Smart Account is not authorized to receive ${allocation.asset}`, 403);
+    }
+
     const sellAmount = usdcRaw(allocation.amountUsd);
     const response = await zeroX.price({ sellToken: USDC, buyToken: record.address, sellAmount: sellAmount.toString(), taker: input.smartAccountAddress, slippageBps: 50 });
     assertPriceResponse(response, allocation.asset);
-    priceWork.push({ asset: allocation.asset, allocationUsd: allocation.amountUsd, sellAmount, tokenAddress: record.address, response, allowanceTarget: targetFrom(response) });
+    priceWork.push({ asset: allocation.asset, allocationUsd: allocation.amountUsd, sellAmount, tokenAddress: record.address, response, allowanceTarget: targetFrom(response), b20Safety });
   }
 
   const allowanceTargets = new Set(priceWork.map(work => work.allowanceTarget.toLowerCase()));
@@ -123,6 +132,11 @@ export async function prepareExecution(input: { userId: string; smartAccountAddr
   ]);
   if (balance < totalSell) throw new ExecutionPreparationError("insufficient_usdc", `Strategy needs ${formatUnits(totalSell, USDC_DECIMALS)} USDC but the smart account balance is lower`, 409);
 
+  const b20Checks: PlanCheck[] = priceWork.flatMap(work => [
+    { name: `b20_transfer_unpaused:${work.asset}`, passed: !work.b20Safety.transferPaused },
+    { name: `b20_receiver_authorized:${work.asset}`, passed: work.b20Safety.receiverAuthorized, detail: `receiver policy ${work.b20Safety.receiverPolicyId.toString()}` },
+  ]);
+
   if (allowance < totalSell) {
     const calls: PlanCall[] = [{
       kind: "approval",
@@ -133,6 +147,7 @@ export async function prepareExecution(input: { userId: string; smartAccountAddr
     }];
     const checks: PlanCheck[] = [
       { name: "asset_registry", passed: true },
+      ...b20Checks,
       { name: "usdc_balance", passed: true },
       { name: "exact_allowance", passed: true, detail: `${formatUnits(totalSell, USDC_DECIMALS)} USDC; no unlimited approval` },
     ];
@@ -150,10 +165,13 @@ export async function prepareExecution(input: { userId: string; smartAccountAddr
   }
 
   const maxDeviationBps = Number(process.env.MAX_REFERENCE_DEVIATION_BPS ?? 200);
-  const maxStaleness = Number(process.env.MAX_REFERENCE_STALENESS_SECONDS ?? 300);
+  // Coinbase B20 Chainlink feeds can legitimately hold their last value outside equity sessions
+  // and have a 24h heartbeat. Production overrides this with a weekend/holiday-tolerant bound.
+  const maxStaleness = Number(process.env.MAX_REFERENCE_STALENESS_SECONDS ?? 345600);
   const calls: PlanCall[] = [];
   const checks: PlanCheck[] = [
     { name: "asset_registry", passed: true },
+    ...b20Checks,
     { name: "usdc_balance", passed: true },
     { name: "usdc_allowance", passed: true, detail: `AllowanceHolder has at least ${formatUnits(totalSell, USDC_DECIMALS)} USDC allowance` },
   ];
@@ -175,7 +193,7 @@ export async function prepareExecution(input: { userId: string; smartAccountAddr
     const deviationBps = referenceConfigured ? Math.round(Math.abs(effectivePriceUsd - reference.priceUsd!) / reference.priceUsd! * 10_000) : null;
     const referenceWithinDeviation = deviationBps != null && deviationBps <= maxDeviationBps;
     checks.push({ name: `reference_configured:${work.asset}`, passed: referenceConfigured, detail: reference.feed ?? "Set a verified Chainlink total-return feed address" });
-    checks.push({ name: `reference_fresh:${work.asset}`, passed: !!referenceFresh, detail: reference.updatedAt ? `${reference.ageSeconds}s old` : "No feed data" });
+    checks.push({ name: `reference_fresh:${work.asset}`, passed: !!referenceFresh, detail: reference.updatedAt ? `${reference.ageSeconds}s old; max ${maxStaleness}s` : "No feed data" });
     checks.push({ name: `reference_deviation:${work.asset}`, passed: !!referenceWithinDeviation, detail: deviationBps == null ? "Unavailable" : `${deviationBps} bps <= ${maxDeviationBps} bps` });
     calls.push({ kind: "swap", label: `Swap ${sellUsd} USDC → ${work.asset}`, to: quote.transaction!.to, data: quote.transaction!.data, value: quote.transaction!.value ?? "0" });
     quoteSummaries.push({ asset: work.asset, sellUsd, buyAmount: quote.buyAmount, tokenDecimals, buyQuantity, effectivePriceUsd, reference, deviationBps });
