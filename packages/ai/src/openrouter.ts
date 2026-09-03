@@ -2,6 +2,7 @@ import type { InvestmentIntent } from "../../core/src/types.ts";
 import { validateInvestmentIntent } from "../../core/src/validation.ts";
 
 const SYSTEM = `Convert the user's portfolio request to the required schema. Never output token addresses, calldata, transactions, wallet operations, or unsupported assets. Allowed assets are NVDAc, GOOGLc, METAc, AAPLc and USDC. Percentages in constraints must be decimals from 0 to 1. Do not claim a trade was executed.`;
+const OPENROUTER_TIMEOUT_MS = 12_000;
 
 const INTENT_SCHEMA = {
   type: "object",
@@ -57,28 +58,52 @@ export type OpenRouterIntentResult = {
   model: string;
 };
 
+function parseStructuredContent(content: unknown): InvestmentIntent {
+  if (typeof content !== "string" || !content.trim()) {
+    throw new OpenRouterRequestError(502, "OpenRouter returned an empty structured intent");
+  }
+  const normalized = content.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  try {
+    return validateInvestmentIntent(JSON.parse(normalized));
+  } catch (error) {
+    if (error instanceof OpenRouterRequestError) throw error;
+    throw new OpenRouterRequestError(502, `OpenRouter returned invalid structured intent: ${error instanceof Error ? error.message : "invalid JSON"}`);
+  }
+}
+
 export async function parseIntentWithOpenRouter(prompt: string, apiKey: string, model: string): Promise<OpenRouterIntentResult> {
-  // Keep the user's selected model first. For free endpoints, let OpenRouter fail over
-  // to its free router when the selected provider is temporarily rate-limited/down.
-  // This never crosses into a paid fallback without the operator explicitly opting in.
   const models = model === "openrouter/free" ? [model] : [model, "openrouter/free"];
-  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-      "HTTP-Referer": "https://stockos-ashen.vercel.app",
-      "X-Title": "StockOS",
-    },
-    body: JSON.stringify({
-      models,
-      temperature: 0,
-      provider: { require_parameters: true },
-      messages: [{ role: "system", content: SYSTEM }, { role: "user", content: prompt }],
-      response_format: { type: "json_schema", json_schema: { name: "stockos_investment_intent", strict: true, schema: INTENT_SCHEMA } },
-    }),
-  });
-  const body = await res.json() as any;
+  let res: Response;
+  try {
+    res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      signal: AbortSignal.timeout(OPENROUTER_TIMEOUT_MS),
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://stockos-ashen.vercel.app",
+        "X-Title": "StockOS",
+      },
+      body: JSON.stringify({
+        models,
+        temperature: 0,
+        max_tokens: 700,
+        provider: { require_parameters: true },
+        messages: [{ role: "system", content: SYSTEM }, { role: "user", content: prompt }],
+        response_format: { type: "json_schema", json_schema: { name: "stockos_investment_intent", strict: true, schema: INTENT_SCHEMA } },
+      }),
+    });
+  } catch (error) {
+    const timedOut = error instanceof DOMException && error.name === "TimeoutError";
+    throw new OpenRouterRequestError(504, timedOut ? "OpenRouter strategy parsing timed out" : "OpenRouter network request failed");
+  }
+
+  let body: any;
+  try {
+    body = await res.json();
+  } catch {
+    throw new OpenRouterRequestError(502, "OpenRouter returned a non-JSON response");
+  }
   if (!res.ok) {
     throw new OpenRouterRequestError(
       res.status,
@@ -86,10 +111,9 @@ export async function parseIntentWithOpenRouter(prompt: string, apiKey: string, 
       body?.error?.code,
     );
   }
-  const content = body.choices?.[0]?.message?.content;
-  if (typeof content !== "string") throw new OpenRouterRequestError(502, "OpenRouter returned no structured intent");
+
   return {
-    intent: validateInvestmentIntent(JSON.parse(content)),
+    intent: parseStructuredContent(body.choices?.[0]?.message?.content),
     model: typeof body.model === "string" ? body.model : model,
   };
 }
