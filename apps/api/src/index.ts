@@ -5,6 +5,7 @@ import { compileStrategy } from "../../../packages/strategy/src/compiler.ts";
 import { evaluatePolicy } from "../../../packages/policy/src/engine.ts";
 import { getAiSettings, resolveAiRuntime, revokeOpenRouterByok, saveOpenRouterByok } from "./lib/ai-runtime.ts";
 import { ExecutionPreparationError, markPlanSubmitted, prepareExecution } from "./lib/execution.ts";
+import { createOnrampBuyQuote, getOnrampBuyOptions, OnrampRequestError } from "./lib/onramp.ts";
 import { requireStockOsSession } from "./lib/session.ts";
 import { persistStrategyDraft } from "./lib/strategy-store.ts";
 
@@ -36,17 +37,36 @@ app.post("/v1/ai/byok/openrouter", async (request, reply) => {
   if (!session) return;
   const body = (request.body ?? {}) as { apiKey?: string; model?: string };
   if (!body.apiKey) return reply.code(400).send({ error: "api_key_required" });
-  try {
-    return await saveOpenRouterByok(session.profile.id, body.apiKey, body.model);
-  } catch (error) {
-    return reply.code(400).send({ error: "byok_verification_failed", message: error instanceof Error ? error.message : "Could not verify BYOK key" });
-  }
+  try { return await saveOpenRouterByok(session.profile.id, body.apiKey, body.model); }
+  catch (error) { return reply.code(400).send({ error: "byok_verification_failed", message: error instanceof Error ? error.message : "Could not verify BYOK key" }); }
 });
 
 app.delete("/v1/ai/byok/openrouter", async (request, reply) => {
   const session = await requireStockOsSession(request, reply);
   if (!session) return;
   return revokeOpenRouterByok(session.profile.id);
+});
+
+app.get("/v1/onramp/buy-options", async (request, reply) => {
+  const session = await requireStockOsSession(request, reply);
+  if (!session) return;
+  const query = (request.query ?? {}) as { country?: string; subdivision?: string };
+  try { return await getOnrampBuyOptions(query); }
+  catch (error) {
+    if (error instanceof OnrampRequestError) return reply.code(error.status).send({ error: "onramp_unavailable", message: error.message });
+    throw error;
+  }
+});
+
+app.post("/v1/onramp/buy-quote", async (request, reply) => {
+  const session = await requireStockOsSession(request, reply);
+  if (!session) return;
+  if (!session.wallet.smartAccountAddress) return reply.code(409).send({ error: "smart_account_required", message: "Smart Account is not ready yet." });
+  try { return await createOnrampBuyQuote((request.body ?? {}) as Record<string, any>, session.wallet.smartAccountAddress); }
+  catch (error) {
+    if (error instanceof OnrampRequestError) return reply.code(error.status).send({ error: "onramp_unavailable", message: error.message });
+    throw error;
+  }
 });
 
 app.post("/v1/strategy/compile", async (request, reply) => {
@@ -61,7 +81,6 @@ app.post("/v1/strategy/compile", async (request, reply) => {
   let effectiveModel = runtime.model;
   let effectiveSource: string = runtime.source;
   let fallbackReason: string | null = null;
-
   try {
     if (runtime.apiKey) {
       const parsed = await parseIntentWithOpenRouter(prompt, runtime.apiKey, runtime.model);
@@ -70,59 +89,40 @@ app.post("/v1/strategy/compile", async (request, reply) => {
     } else {
       intent = demoIntent(prompt);
       effectiveSource = "deterministic_demo";
-      effectiveModel = "deterministic-parser";
+      effectiveModel = "deterministic-parser-v2";
     }
   } catch (error) {
     if (error instanceof OpenRouterRequestError && runtime.source === "managed") {
-      intent = demoIntent(prompt);
-      effectiveSource = "deterministic_fallback";
-      effectiveModel = "deterministic-parser";
-      fallbackReason = `${error.status}:${error.message}`;
-      request.log.warn({ status: error.status, requestedModel: runtime.model }, "managed AI unavailable; deterministic parser used");
+      try {
+        intent = demoIntent(prompt);
+        effectiveSource = "deterministic_fallback";
+        effectiveModel = "deterministic-parser-v2";
+        fallbackReason = `${error.status}:${error.message}`;
+        request.log.warn({ status: error.status, requestedModel: runtime.model }, "managed AI unavailable; deterministic parser used");
+      } catch (fallbackError) {
+        return reply.code(503).send({ error: "strategy_interpretation_failed", message: fallbackError instanceof Error ? fallbackError.message : "Could not interpret this strategy", requestedModel: runtime.model });
+      }
     } else if (error instanceof OpenRouterRequestError) {
       const statusCode = error.status === 429 ? 429 : error.status === 504 ? 504 : 503;
       return reply.code(statusCode).send({
         error: error.status === 429 ? "ai_capacity_limited" : error.status === 504 ? "ai_timeout" : "ai_provider_unavailable",
-        message: error.status === 429
-          ? "Your selected OpenRouter model is currently rate-limited or at capacity."
-          : error.status === 504
-            ? "Your selected OpenRouter model did not respond before StockOS's timeout."
-            : "The selected AI provider could not produce a valid structured strategy.",
+        message: error.status === 429 ? "Your selected OpenRouter model is currently rate-limited or at capacity." : error.status === 504 ? "Your selected OpenRouter model did not respond before StockOS's timeout." : "The selected AI provider could not produce a valid strategy.",
         provider: "openrouter",
         requestedModel: runtime.model,
       });
-    } else {
-      throw error;
-    }
+    } else { throw error; }
   }
 
   const strategy = compileStrategy(intent);
-  if (fallbackReason) {
-    strategy.warnings.push("Managed AI was unavailable, so StockOS used its deterministic fallback parser. Review the generated strategy before proceeding.");
-  }
-  const policy = evaluatePolicy(intent, strategy, {
-    maxSlippageBps: 100,
-    requestedSlippageBps: 50,
-  });
-  const draft = await persistStrategyDraft({
-    userId: session.profile.id,
-    prompt,
-    intent,
-    strategy,
-    aiSource: effectiveSource,
-    aiModel: effectiveModel,
-  });
+  if (fallbackReason) strategy.warnings.push("Managed AI was unavailable, so StockOS used the deterministic parser. Exact percentages and named assets are preserved; review the result before proceeding.");
+  const policy = evaluatePolicy(intent, strategy, { maxSlippageBps: 100, requestedSlippageBps: 50 });
+  const draft = await persistStrategyDraft({ userId: session.profile.id, prompt, intent, strategy, aiSource: effectiveSource, aiModel: effectiveModel });
   return {
     intent,
     strategy,
     policy,
     draft,
-    ai: {
-      source: effectiveSource,
-      model: effectiveModel,
-      requestedModel: runtime.model,
-      fallbackReason,
-    },
+    ai: { source: effectiveSource, model: effectiveModel, requestedModel: runtime.model, fallbackReason },
     session: { smartAccountAddress: session.wallet.smartAccountAddress },
   };
 });
@@ -130,14 +130,11 @@ app.post("/v1/strategy/compile", async (request, reply) => {
 app.post("/v1/execution/prepare", async (request, reply) => {
   const session = await requireStockOsSession(request, reply);
   if (!session) return;
-  if (!session.wallet.smartAccountAddress) {
-    return reply.code(409).send({ error: "smart_account_required", message: "CDP Smart Account is not ready yet." });
-  }
+  if (!session.wallet.smartAccountAddress) return reply.code(409).send({ error: "smart_account_required", message: "CDP Smart Account is not ready yet." });
   const body = (request.body ?? {}) as { strategyVersionId?: string };
   if (!body.strategyVersionId) return reply.code(400).send({ error: "strategy_version_required" });
-  try {
-    return await prepareExecution({ userId: session.profile.id, smartAccountAddress: session.wallet.smartAccountAddress, strategyVersionId: body.strategyVersionId });
-  } catch (error) {
+  try { return await prepareExecution({ userId: session.profile.id, smartAccountAddress: session.wallet.smartAccountAddress, strategyVersionId: body.strategyVersionId }); }
+  catch (error) {
     if (error instanceof ExecutionPreparationError) return reply.code(error.statusCode).send({ error: error.code, message: error.message });
     throw error;
   }
@@ -149,9 +146,8 @@ app.post("/v1/execution/:planId/submitted", async (request, reply) => {
   const { planId } = request.params as { planId: string };
   const body = (request.body ?? {}) as { transactionHash?: string };
   if (!body.transactionHash) return reply.code(400).send({ error: "transaction_hash_required" });
-  try {
-    return await markPlanSubmitted({ userId: session.profile.id, planId, transactionHash: body.transactionHash });
-  } catch (error) {
+  try { return await markPlanSubmitted({ userId: session.profile.id, planId, transactionHash: body.transactionHash }); }
+  catch (error) {
     if (error instanceof ExecutionPreparationError) return reply.code(error.statusCode).send({ error: error.code, message: error.message });
     throw error;
   }
