@@ -11,7 +11,8 @@
     "@coinbase/cdp-sdk": "latest",
     "@fastify/cors": "latest",
     "@supabase/supabase-js": "latest",
-    "fastify": "latest"
+    "fastify": "latest",
+    "viem": "latest"
   },
   "devDependencies": {
     "tsx": "latest",
