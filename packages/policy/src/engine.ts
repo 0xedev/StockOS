@@ -26,13 +26,28 @@ export function evaluatePolicy(intent: InvestmentIntent, strategy: CompiledStrat
       passed: !!record && record.enabled && (allocation.asset === "USDC" || !!record.address),
     });
   }
-  for (const constraint of intent.constraints.filter(constraint => constraint.type === "MAX_WEIGHT")) {
-    const weight = strategy.allocations.find(allocation => allocation.asset === constraint.asset)?.weight ?? 0;
-    checks.push({
-      name: `max_weight:${constraint.asset}`,
-      passed: weight <= constraint.value + 1e-9,
-      detail: `${weight} <= ${constraint.value}`,
-    });
+  for (const constraint of intent.constraints) {
+    if (constraint.type === "MAX_WEIGHT") {
+      const weight = strategy.allocations.find(allocation => allocation.asset === constraint.asset)?.weight ?? 0;
+      checks.push({
+        name: `max_weight:${constraint.asset}`,
+        passed: weight <= constraint.value + 1e-9,
+        detail: `${weight} <= ${constraint.value}`,
+      });
+    } else if (constraint.type === "MIN_WEIGHT") {
+      const weight = strategy.allocations.find(allocation => allocation.asset === constraint.asset)?.weight ?? 0;
+      checks.push({
+        name: `min_weight:${constraint.asset}`,
+        passed: weight + 1e-9 >= constraint.value,
+        detail: `${weight} >= ${constraint.value}`,
+      });
+    } else if (constraint.type === "MIN_CASH") {
+      checks.push({
+        name: "min_cash",
+        passed: strategy.cashWeight + 1e-9 >= constraint.value,
+        detail: `${strategy.cashWeight} >= ${constraint.value}`,
+      });
+    }
   }
   return { allowed: checks.every(check => check.passed), checks };
 }
