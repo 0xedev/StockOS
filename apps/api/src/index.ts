@@ -59,6 +59,9 @@ app.post("/v1/strategy/compile", async (request, reply) => {
 
   let intent;
   let effectiveModel = runtime.model;
+  let effectiveSource: string = runtime.source;
+  let fallbackReason: string | null = null;
+
   try {
     if (runtime.apiKey) {
       const parsed = await parseIntentWithOpenRouter(prompt, runtime.apiKey, runtime.model);
@@ -66,23 +69,39 @@ app.post("/v1/strategy/compile", async (request, reply) => {
       effectiveModel = parsed.model;
     } else {
       intent = demoIntent(prompt);
+      effectiveSource = "deterministic_demo";
+      effectiveModel = "deterministic-parser";
     }
   } catch (error) {
-    if (error instanceof OpenRouterRequestError) {
-      const statusCode = error.status === 429 ? 429 : 503;
+    // Managed free inference is a convenience layer, not a dependency that should
+    // make the deterministic portfolio engine unavailable. Fail over to the narrow
+    // local parser and expose that fact in the response/audit trail. BYOK users,
+    // however, explicitly selected their provider, so surface provider failures.
+    if (error instanceof OpenRouterRequestError && runtime.source === "managed") {
+      intent = demoIntent(prompt);
+      effectiveSource = "deterministic_fallback";
+      effectiveModel = "deterministic-parser";
+      fallbackReason = `${error.status}:${error.message}`;
+      request.log.warn({ status: error.status, requestedModel: runtime.model }, "managed AI unavailable; deterministic parser used");
+    } else if (error instanceof OpenRouterRequestError) {
+      const statusCode = error.status === 429 ? 429 : error.status === 504 ? 504 : 503;
       return reply.code(statusCode).send({
-        error: error.status === 429 ? "ai_capacity_limited" : "ai_provider_unavailable",
+        error: error.status === 429 ? "ai_capacity_limited" : error.status === 504 ? "ai_timeout" : "ai_provider_unavailable",
         message: error.status === 429
-          ? "The selected OpenRouter free model is currently rate-limited or at capacity. Try again shortly, use BYOK, or switch to a paid model for production reliability."
-          : "The AI provider could not produce a strategy right now. No trade was created or executed.",
+          ? "Your selected OpenRouter model is currently rate-limited or at capacity."
+          : error.status === 504
+            ? "Your selected OpenRouter model did not respond before StockOS's timeout."
+            : "The selected AI provider could not produce a valid structured strategy.",
         provider: "openrouter",
         requestedModel: runtime.model,
       });
+    } else {
+      throw error;
     }
-    throw error;
   }
 
   const strategy = compileStrategy(intent);
+  if (fallbackReason) strategy.warnings.push("Managed AI was unavailable, so StockOS used its deterministic fallback parser. Review the generated strategy before proceeding.");
   const policy = evaluatePolicy(intent, strategy, {
     eligible: session.profile.eligibilityStatus === "eligible",
     maxSlippageBps: 100,
@@ -93,7 +112,7 @@ app.post("/v1/strategy/compile", async (request, reply) => {
     prompt,
     intent,
     strategy,
-    aiSource: runtime.source,
+    aiSource: effectiveSource,
     aiModel: effectiveModel,
   });
   return {
@@ -101,7 +120,12 @@ app.post("/v1/strategy/compile", async (request, reply) => {
     strategy,
     policy,
     draft,
-    ai: { source: runtime.source, model: effectiveModel, requestedModel: runtime.model },
+    ai: {
+      source: effectiveSource,
+      model: effectiveModel,
+      requestedModel: runtime.model,
+      fallbackReason,
+    },
     session: { smartAccountAddress: session.wallet.smartAccountAddress },
   };
 });
