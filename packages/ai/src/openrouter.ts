@@ -41,12 +41,37 @@ const INTENT_SCHEMA = {
   required: ["intentVersion", "action", "capital", "themes", "risk", "exclusions", "constraints", "automation"],
 } as const;
 
-export async function parseIntentWithOpenRouter(prompt: string, apiKey: string, model: string): Promise<InvestmentIntent> {
+export class OpenRouterRequestError extends Error {
+  constructor(
+    public status: number,
+    message: string,
+    public code?: string | number,
+  ) {
+    super(message);
+    this.name = "OpenRouterRequestError";
+  }
+}
+
+export type OpenRouterIntentResult = {
+  intent: InvestmentIntent;
+  model: string;
+};
+
+export async function parseIntentWithOpenRouter(prompt: string, apiKey: string, model: string): Promise<OpenRouterIntentResult> {
+  // Keep the user's selected model first. For free endpoints, let OpenRouter fail over
+  // to its free router when the selected provider is temporarily rate-limited/down.
+  // This never crosses into a paid fallback without the operator explicitly opting in.
+  const models = model === "openrouter/free" ? [model] : [model, "openrouter/free"];
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json", "HTTP-Referer": "https://stockos.app", "X-Title": "StockOS" },
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+      "HTTP-Referer": "https://stockos-ashen.vercel.app",
+      "X-Title": "StockOS",
+    },
     body: JSON.stringify({
-      model,
+      models,
       temperature: 0,
       provider: { require_parameters: true },
       messages: [{ role: "system", content: SYSTEM }, { role: "user", content: prompt }],
@@ -54,10 +79,19 @@ export async function parseIntentWithOpenRouter(prompt: string, apiKey: string, 
     }),
   });
   const body = await res.json() as any;
-  if (!res.ok) throw new Error(`OpenRouter ${res.status}: ${body?.error?.message ?? "request failed"}`);
+  if (!res.ok) {
+    throw new OpenRouterRequestError(
+      res.status,
+      body?.error?.message ?? "OpenRouter request failed",
+      body?.error?.code,
+    );
+  }
   const content = body.choices?.[0]?.message?.content;
-  if (typeof content !== "string") throw new Error("OpenRouter returned no structured intent");
-  return validateInvestmentIntent(JSON.parse(content));
+  if (typeof content !== "string") throw new OpenRouterRequestError(502, "OpenRouter returned no structured intent");
+  return {
+    intent: validateInvestmentIntent(JSON.parse(content)),
+    model: typeof body.model === "string" ? body.model : model,
+  };
 }
 
 export function demoIntent(prompt: string): InvestmentIntent {
