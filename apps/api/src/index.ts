@@ -1,9 +1,12 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
+import { formatEther, formatUnits, parseUnits } from "viem";
 import { demoIntent, OpenRouterRequestError, parseIntentWithOpenRouter } from "../../../packages/ai/src/openrouter.ts";
+import { ASSETS } from "../../../packages/b20/src/registry.ts";
 import { compileStrategy } from "../../../packages/strategy/src/compiler.ts";
 import { evaluatePolicy } from "../../../packages/policy/src/engine.ts";
 import { getAiSettings, resolveAiRuntime, revokeOpenRouterByok, saveOpenRouterByok } from "./lib/ai-runtime.ts";
+import { assertEvmAddress, encodeTokenTransfer, readNativeBalance, readTokenBalance } from "./lib/chain.ts";
 import { ExecutionPreparationError, markPlanSubmitted, prepareExecution } from "./lib/execution.ts";
 import { createOnrampBuyQuote, getOnrampBuyOptions, OnrampRequestError } from "./lib/onramp.ts";
 import { requireStockOsSession } from "./lib/session.ts";
@@ -24,6 +27,70 @@ app.post("/v1/session", async (request, reply) => {
   const session = await requireStockOsSession(request, reply);
   if (!session) return;
   return session;
+});
+
+app.get("/v1/wallet/summary", async (request, reply) => {
+  const session = await requireStockOsSession(request, reply);
+  if (!session) return;
+  const account = session.wallet.smartAccountAddress;
+  const usdc = ASSETS.USDC;
+  if (!account) return reply.code(409).send({ error: "smart_account_required", message: "Smart Account is not ready yet." });
+  if (!usdc.address || usdc.decimals == null) throw new Error("USDC registry configuration is incomplete");
+  const [nativeBalance, usdcBalance] = await Promise.all([
+    readNativeBalance(account),
+    readTokenBalance(usdc.address, account),
+  ]);
+  return {
+    address: account,
+    network: "base",
+    chainId: 8453,
+    balances: {
+      ETH: { raw: nativeBalance.toString(), formatted: formatEther(nativeBalance) },
+      USDC: { raw: usdcBalance.toString(), formatted: formatUnits(usdcBalance, usdc.decimals) },
+    },
+  };
+});
+
+app.post("/v1/wallet/send/prepare", async (request, reply) => {
+  const session = await requireStockOsSession(request, reply);
+  if (!session) return;
+  const account = session.wallet.smartAccountAddress;
+  if (!account) return reply.code(409).send({ error: "smart_account_required", message: "Smart Account is not ready yet." });
+
+  const body = (request.body ?? {}) as { asset?: string; to?: string; amount?: string | number };
+  if (body.asset !== "USDC") return reply.code(400).send({ error: "unsupported_transfer_asset", message: "Manual wallet sends currently support Base USDC only." });
+  if (!body.to) return reply.code(400).send({ error: "recipient_required", message: "Recipient address is required." });
+  let recipient: string;
+  try { recipient = assertEvmAddress(body.to.trim(), "recipient"); }
+  catch (error) { return reply.code(400).send({ error: "invalid_recipient", message: error instanceof Error ? error.message : "Invalid recipient" }); }
+
+  const amountText = String(body.amount ?? "").trim();
+  if (!/^\d+(?:\.\d{1,6})?$/.test(amountText) || Number(amountText) <= 0) {
+    return reply.code(400).send({ error: "invalid_amount", message: "Enter a positive USDC amount with up to 6 decimal places." });
+  }
+  const usdc = ASSETS.USDC;
+  if (!usdc.address || usdc.decimals == null) throw new Error("USDC registry configuration is incomplete");
+  const rawAmount = parseUnits(amountText, usdc.decimals);
+  const balance = await readTokenBalance(usdc.address, account);
+  if (rawAmount > balance) {
+    return reply.code(409).send({
+      error: "insufficient_usdc_balance",
+      message: `Insufficient USDC. Available balance: ${formatUnits(balance, usdc.decimals)} USDC.`,
+    });
+  }
+  return {
+    asset: "USDC",
+    amount: amountText,
+    recipient,
+    balanceBefore: formatUnits(balance, usdc.decimals),
+    call: {
+      kind: "transfer",
+      label: `Send ${amountText} USDC`,
+      to: usdc.address,
+      data: encodeTokenTransfer(recipient, rawAmount),
+      value: "0",
+    },
+  };
 });
 
 app.get("/v1/ai/settings", async (request, reply) => {
