@@ -9,6 +9,7 @@ const erc20Abi = parseAbi([
   "function balanceOf(address account) view returns (uint256)",
   "function allowance(address owner,address spender) view returns (uint256)",
   "function approve(address spender,uint256 amount) returns (bool)",
+  "function transfer(address to,uint256 amount) returns (bool)",
 ]);
 const b20Abi = parseAbi([
   "function isPaused(uint8 feature) view returns (bool)",
@@ -29,9 +30,13 @@ export function getBaseClient() {
   return client;
 }
 
-function address(value: string, label: string): Address {
+export function assertEvmAddress(value: string, label = "address"): Address {
   if (!isAddress(value)) throw new Error(`${label} is not a valid EVM address`);
   return value;
+}
+
+function address(value: string, label: string): Address {
+  return assertEvmAddress(value, label);
 }
 
 export async function readTokenDecimals(token: string): Promise<number> {
@@ -41,6 +46,10 @@ export async function readTokenDecimals(token: string): Promise<number> {
 
 export async function readTokenBalance(token: string, account: string): Promise<bigint> {
   return getBaseClient().readContract({ address: address(token, "token"), abi: erc20Abi, functionName: "balanceOf", args: [address(account, "account")] });
+}
+
+export async function readNativeBalance(account: string): Promise<bigint> {
+  return getBaseClient().getBalance({ address: address(account, "account") });
 }
 
 export async function readAllowance(token: string, owner: string, spender: string): Promise<bigint> {
@@ -56,6 +65,11 @@ export function encodeExactApproval(spender: string, amount: bigint): `0x${strin
   return encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [address(spender, "spender"), amount] });
 }
 
+export function encodeTokenTransfer(recipient: string, amount: bigint): `0x${string}` {
+  if (amount <= 0n) throw new Error("Transfer amount must be positive");
+  return encodeFunctionData({ abi: erc20Abi, functionName: "transfer", args: [address(recipient, "recipient"), amount] });
+}
+
 export type B20ReceiveSafety = {
   transferPaused: boolean;
   receiverPolicyId: bigint;
@@ -69,7 +83,7 @@ export async function readB20ReceiveSafety(token: string, receiver: string): Pro
   const tokenAddress = address(token, "B20 token");
   const receiverAddress = address(receiver, "receiver");
   const [transferPaused, receiverScope] = await Promise.all([
-    getBaseClient().readContract({ address: tokenAddress, abi: b20Abi, functionName: "isPaused", args: [0] }), // PausableFeature.TRANSFER
+    getBaseClient().readContract({ address: tokenAddress, abi: b20Abi, functionName: "isPaused", args: [0] }),
     getBaseClient().readContract({ address: tokenAddress, abi: b20Abi, functionName: "TRANSFER_RECEIVER_POLICY" }),
   ]);
   const receiverPolicyId = await getBaseClient().readContract({
