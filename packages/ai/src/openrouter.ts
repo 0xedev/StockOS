@@ -115,36 +115,105 @@ const aliases: Array<{ asset: SupportedAsset; names: string[] }> = [
   { asset: "AAPLc", names: ["apple", "aapl", "aaplc"] },
   { asset: "USDC", names: ["cash", "usdc"] },
 ];
+const CONSTRAINT_WORDS = /\b(?:max|maximum|below|under|not more than|at most|cap(?:ped)?|minimum|min|at least)\b/i;
 
 function escapedNames(names: string[]) { return names.map(name => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"); }
 function mentioned(prompt: string, names: string[]) { return new RegExp(`\\b(?:${escapedNames(names)})\\b`, "i").test(prompt); }
-function percentageFor(prompt: string, names: string[]): number | null {
+
+function allocationPercentageFor(prompt: string, names: string[]): number | null {
   const joined = escapedNames(names);
-  const after = prompt.match(new RegExp(`(?:${joined})[^\\d%]{0,24}(\\d+(?:\\.\\d+)?)\\s*%`, "i"));
-  const before = prompt.match(new RegExp(`(\\d+(?:\\.\\d+)?)\\s*%[^,.;]{0,24}(?:${joined})`, "i"));
-  const value = after?.[1] ?? before?.[1];
-  return value == null ? null : Number(value) / 100;
+  const patterns = [
+    new RegExp(`(?:${joined})[^,.;]{0,30}?(\\d+(?:\\.\\d+)?)\\s*%`, "i"),
+    new RegExp(`(\\d+(?:\\.\\d+)?)\\s*%[^,.;]{0,30}?(?:${joined})`, "i"),
+  ];
+  for (const pattern of patterns) {
+    const match = prompt.match(pattern);
+    if (!match || CONSTRAINT_WORDS.test(match[0])) continue;
+    return Number(match[1]) / 100;
+  }
+  return null;
+}
+
+function maxWeightFor(prompt: string, names: string[]): number | null {
+  const joined = escapedNames(names);
+  const patterns = [
+    new RegExp(`(?:${joined})[^,.;]{0,20}?(?:max(?:imum)?|below|under|not more than|at most|cap(?:ped)?(?:\\s+at)?)\\s*(\\d+(?:\\.\\d+)?)\\s*%`, "i"),
+    new RegExp(`(?:max(?:imum)?|not more than|at most|cap(?:ped)?(?:\\s+at)?)\\s*(\\d+(?:\\.\\d+)?)\\s*%[^,.;]{0,20}?(?:${joined})`, "i"),
+  ];
+  for (const pattern of patterns) {
+    const match = prompt.match(pattern);
+    if (match) return Number(match[1]) / 100;
+  }
+  return null;
+}
+
+function minCashFor(prompt: string): number | null {
+  const patterns = [
+    /(?:at least|minimum|min)\s+(\d+(?:\.\d+)?)\s*%\s*(?:cash|usdc)/i,
+    /(?:cash|usdc)[^,.;]{0,20}?(?:at least|minimum|min)\s+(\d+(?:\.\d+)?)\s*%/i,
+  ];
+  for (const pattern of patterns) {
+    const match = prompt.match(pattern);
+    if (match) return Number(match[1]) / 100;
+  }
+  return null;
+}
+
+function distributeWithCaps(candidates: SupportedAsset[], investable: number, maxes: Map<SupportedAsset, number>) {
+  const weights = new Map<SupportedAsset, number>();
+  if (!candidates.length || investable <= 0) return weights;
+  for (const asset of candidates) weights.set(asset, investable / candidates.length);
+  let overflow = 0;
+  for (const asset of candidates) {
+    const cap = maxes.get(asset);
+    const current = weights.get(asset)!;
+    if (cap != null && current > cap) {
+      overflow += current - cap;
+      weights.set(asset, cap);
+    }
+  }
+  let guard = 0;
+  while (overflow > 1e-10 && guard++ < 20) {
+    const open = candidates.filter(asset => (maxes.get(asset) ?? 1) - (weights.get(asset) ?? 0) > 1e-10);
+    if (!open.length) break;
+    const each = overflow / open.length;
+    let consumed = 0;
+    for (const asset of open) {
+      const current = weights.get(asset) ?? 0;
+      const capacity = (maxes.get(asset) ?? 1) - current;
+      const add = Math.min(each, capacity);
+      weights.set(asset, current + add);
+      consumed += add;
+    }
+    if (consumed <= 1e-12) break;
+    overflow -= consumed;
+  }
+  return { weights, unallocated: Math.max(0, overflow) };
 }
 
 export function demoIntent(prompt: string): InvestmentIntent {
   const amountMatch = prompt.match(/\$\s*([\d,.]+)/) ?? prompt.match(/(?:invest|portfolio|with|use)\s+(?:about\s+)?([\d,.]+)\s*(?:usdc|dollars?|usd)?/i);
   const amount = Number(amountMatch?.[1]?.replaceAll(",", "") ?? 500);
-  const exclusions = aliases.filter(({ names }) => new RegExp(`(?:no|exclude|without|avoid)\\s+(?:${escapedNames(names)})`, "i").test(prompt)).map(({ asset }) => asset);
+  const exclusions = aliases
+    .filter(({ names }) => new RegExp(`(?:no|exclude|without|avoid)\\s+(?:${escapedNames(names)})`, "i").test(prompt))
+    .map(({ asset }) => asset);
+
+  const risk = /conservative|low[ -]?risk/i.test(prompt) ? "conservative" : /aggressive|high[ -]?risk/i.test(prompt) ? "aggressive" : "moderate";
+  const maxes = new Map<SupportedAsset, number>();
+  for (const entry of aliases.filter(entry => entry.asset !== "USDC")) {
+    const value = maxWeightFor(prompt, entry.names);
+    if (value != null) maxes.set(entry.asset, value);
+  }
+  const cashMinimum = minCashFor(prompt);
+  const constraints: Array<Record<string, any>> = [...maxes.entries()].map(([asset, value]) => ({ type: "MAX_WEIGHT", asset, value }));
+  if (cashMinimum != null) constraints.push({ type: "MIN_CASH", asset: null, value: cashMinimum });
+
   const explicit = new Map<SupportedAsset, number>();
   for (const entry of aliases) {
     if (exclusions.includes(entry.asset)) continue;
-    const weight = percentageFor(prompt, entry.names);
+    const weight = allocationPercentageFor(prompt, entry.names);
     if (weight != null && weight > 0) explicit.set(entry.asset, weight);
   }
-
-  const maxConstraints = aliases.flatMap(entry => {
-    const joined = escapedNames(entry.names);
-    const match = prompt.match(new RegExp(`(?:${joined})[^\\d%]{0,24}(?:max|maximum|below|under|not more than|cap(?:ped)? at)?[^\\d%]{0,12}(\\d+(?:\\.\\d+)?)\\s*%`, "i"));
-    return match ? [{ type: "MAX_WEIGHT" as const, asset: entry.asset, value: Number(match[1]) / 100 }] : [];
-  });
-  const cashMinimum = prompt.match(/(?:at least|minimum|min)\s+(\d+(?:\.\d+)?)\s*%\s*(?:cash|usdc)/i);
-  const constraints: any[] = [...maxConstraints];
-  if (cashMinimum) constraints.push({ type: "MIN_CASH", asset: null, value: Number(cashMinimum[1]) / 100 });
 
   let targetAllocations: Array<{ asset: SupportedAsset; weight: number }>;
   const explicitTotal = [...explicit.values()].reduce((sum, weight) => sum + weight, 0);
@@ -153,16 +222,28 @@ export function demoIntent(prompt: string): InvestmentIntent {
     if (explicitTotal < 0.999) explicit.set("USDC", (explicit.get("USDC") ?? 0) + (1 - explicitTotal));
     targetAllocations = [...explicit.entries()].map(([asset, weight]) => ({ asset, weight }));
   } else {
-    const stocks = aliases.filter(entry => entry.asset !== "USDC" && !exclusions.includes(entry.asset) && mentioned(prompt, entry.names)).map(entry => entry.asset);
-    const candidates = stocks.length ? stocks : aliases.filter(entry => entry.asset !== "USDC" && !exclusions.includes(entry.asset)).map(entry => entry.asset);
+    const namedStocks = aliases
+      .filter(entry => entry.asset !== "USDC" && !exclusions.includes(entry.asset) && mentioned(prompt, entry.names))
+      .map(entry => entry.asset);
+    const selectionLanguage = /\b(?:across|between|among|only|include|focus(?:ed)?\s+on|prefer|mostly|split|equal(?:ly)?)\b/i.test(prompt);
+    const allStocks = aliases.filter(entry => entry.asset !== "USDC" && !exclusions.includes(entry.asset)).map(entry => entry.asset);
+    const candidates = selectionLanguage && namedStocks.length ? namedStocks : allStocks;
     if (!candidates.length) throw new Error("No supported assets remain after exclusions");
-    const cashRequested = percentageFor(prompt, ["cash", "usdc"]) ?? 0;
-    const stockWeight = (1 - cashRequested) / candidates.length;
-    targetAllocations = candidates.map(asset => ({ asset, weight: stockWeight }));
-    if (cashRequested > 0) targetAllocations.push({ asset: "USDC", weight: cashRequested });
+
+    const explicitCash = allocationPercentageFor(prompt, ["cash", "usdc"]);
+    const defaultCash = risk === "conservative" ? 0.25 : risk === "moderate" ? 0.10 : 0.05;
+    let cashWeight = Math.max(explicitCash ?? 0, cashMinimum ?? 0, explicitCash == null && cashMinimum == null ? defaultCash : 0);
+    cashWeight = Math.min(cashWeight, 0.95);
+    const distributed = distributeWithCaps(candidates, 1 - cashWeight, maxes);
+    if (!(distributed instanceof Map)) {
+      cashWeight += distributed.unallocated;
+      targetAllocations = [...distributed.weights.entries()].filter(([, weight]) => weight > 1e-10).map(([asset, weight]) => ({ asset, weight }));
+    } else {
+      targetAllocations = [...distributed.entries()].map(([asset, weight]) => ({ asset, weight }));
+    }
+    if (cashWeight > 1e-10) targetAllocations.push({ asset: "USDC", weight: cashWeight });
   }
 
-  const risk = /conservative|low[ -]?risk/i.test(prompt) ? "conservative" : /aggressive|high[ -]?risk/i.test(prompt) ? "aggressive" : "moderate";
   return validateInvestmentIntent({
     intentVersion: 2,
     action: /rebalance/i.test(prompt) ? "REBALANCE" : /update|change|modify/i.test(prompt) ? "UPDATE_PORTFOLIO" : "CREATE_PORTFOLIO",
