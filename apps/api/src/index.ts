@@ -1,6 +1,6 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
-import { demoIntent, parseIntentWithOpenRouter } from "../../../packages/ai/src/openrouter.ts";
+import { demoIntent, OpenRouterRequestError, parseIntentWithOpenRouter } from "../../../packages/ai/src/openrouter.ts";
 import { compileStrategy } from "../../../packages/strategy/src/compiler.ts";
 import { evaluatePolicy } from "../../../packages/policy/src/engine.ts";
 import { getAiSettings, resolveAiRuntime, revokeOpenRouterByok, saveOpenRouterByok } from "./lib/ai-runtime.ts";
@@ -56,7 +56,32 @@ app.post("/v1/strategy/compile", async (request, reply) => {
   if (!body.prompt?.trim()) return reply.code(400).send({ error: "prompt_required" });
   const prompt = body.prompt.trim();
   const runtime = await resolveAiRuntime(session.profile.id);
-  const intent = runtime.apiKey ? await parseIntentWithOpenRouter(prompt, runtime.apiKey, runtime.model) : demoIntent(prompt);
+
+  let intent;
+  let effectiveModel = runtime.model;
+  try {
+    if (runtime.apiKey) {
+      const parsed = await parseIntentWithOpenRouter(prompt, runtime.apiKey, runtime.model);
+      intent = parsed.intent;
+      effectiveModel = parsed.model;
+    } else {
+      intent = demoIntent(prompt);
+    }
+  } catch (error) {
+    if (error instanceof OpenRouterRequestError) {
+      const statusCode = error.status === 429 ? 429 : 503;
+      return reply.code(statusCode).send({
+        error: error.status === 429 ? "ai_capacity_limited" : "ai_provider_unavailable",
+        message: error.status === 429
+          ? "The selected OpenRouter free model is currently rate-limited or at capacity. Try again shortly, use BYOK, or switch to a paid model for production reliability."
+          : "The AI provider could not produce a strategy right now. No trade was created or executed.",
+        provider: "openrouter",
+        requestedModel: runtime.model,
+      });
+    }
+    throw error;
+  }
+
   const strategy = compileStrategy(intent);
   const policy = evaluatePolicy(intent, strategy, {
     eligible: session.profile.eligibilityStatus === "eligible",
@@ -69,14 +94,14 @@ app.post("/v1/strategy/compile", async (request, reply) => {
     intent,
     strategy,
     aiSource: runtime.source,
-    aiModel: runtime.model,
+    aiModel: effectiveModel,
   });
   return {
     intent,
     strategy,
     policy,
     draft,
-    ai: { source: runtime.source, model: runtime.model },
+    ai: { source: runtime.source, model: effectiveModel, requestedModel: runtime.model },
     session: { smartAccountAddress: session.wallet.smartAccountAddress },
   };
 });
