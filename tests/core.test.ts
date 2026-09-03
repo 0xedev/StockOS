@@ -12,8 +12,9 @@ assert.equal(strategy.totalUsd, 500);
 assert.equal(strategy.cashWeight, 0.10);
 assert.ok((strategy.allocations.find(a => a.asset === "NVDAc")?.weight ?? 1) <= 0.35 + 1e-9);
 
-const policy = evaluatePolicy(intent, strategy, { eligible: true, maxSlippageBps: 100, requestedSlippageBps: 50 });
+const policy = evaluatePolicy(intent, strategy, { maxSlippageBps: 100, requestedSlippageBps: 50 });
 assert.equal(policy.allowed, true);
+assert.equal(policy.checks.some(check => check.name === "eligibility"), false);
 
 assert.throws(() => validateInvestmentIntent({
   intentVersion: 1,
@@ -35,4 +36,4 @@ assert.equal(rawFromScaled(scaled, 8, multiplier), raw);
 const encrypted = encryptByok("sk-or-test-secret", "stockos-master-test");
 assert.equal(decryptByok(encrypted, "stockos-master-test"), "sk-or-test-secret");
 
-console.log(JSON.stringify({ intent, strategy, policy, unsupportedAssetRejected: true, multiplierRoundTrip: true, byokRoundTrip: true }, null, 2));
+console.log(JSON.stringify({ intent, strategy, policy, eligibilityGateRemoved: true, unsupportedAssetRejected: true, multiplierRoundTrip: true, byokRoundTrip: true }, null, 2));

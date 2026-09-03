@@ -73,10 +73,6 @@ app.post("/v1/strategy/compile", async (request, reply) => {
       effectiveModel = "deterministic-parser";
     }
   } catch (error) {
-    // Managed free inference is a convenience layer, not a dependency that should
-    // make the deterministic portfolio engine unavailable. Fail over to the narrow
-    // local parser and expose that fact in the response/audit trail. BYOK users,
-    // however, explicitly selected their provider, so surface provider failures.
     if (error instanceof OpenRouterRequestError && runtime.source === "managed") {
       intent = demoIntent(prompt);
       effectiveSource = "deterministic_fallback";
@@ -101,9 +97,10 @@ app.post("/v1/strategy/compile", async (request, reply) => {
   }
 
   const strategy = compileStrategy(intent);
-  if (fallbackReason) strategy.warnings.push("Managed AI was unavailable, so StockOS used its deterministic fallback parser. Review the generated strategy before proceeding.");
+  if (fallbackReason) {
+    strategy.warnings.push("Managed AI was unavailable, so StockOS used its deterministic fallback parser. Review the generated strategy before proceeding.");
+  }
   const policy = evaluatePolicy(intent, strategy, {
-    eligible: session.profile.eligibilityStatus === "eligible",
     maxSlippageBps: 100,
     requestedSlippageBps: 50,
   });
@@ -133,9 +130,6 @@ app.post("/v1/strategy/compile", async (request, reply) => {
 app.post("/v1/execution/prepare", async (request, reply) => {
   const session = await requireStockOsSession(request, reply);
   if (!session) return;
-  if (session.profile.eligibilityStatus !== "eligible") {
-    return reply.code(403).send({ error: "eligibility_required", message: "Tokenized-stock execution is available only after StockOS confirms jurisdictional eligibility." });
-  }
   if (!session.wallet.smartAccountAddress) {
     return reply.code(409).send({ error: "smart_account_required", message: "CDP Smart Account is not ready yet." });
   }

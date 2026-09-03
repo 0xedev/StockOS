@@ -12,7 +12,7 @@ type EndUserLike = {
 };
 
 export type StockOsSession = {
-  profile: { id: string; cdpUserId: string; email: string | null; eligibilityStatus: string };
+  profile: { id: string; cdpUserId: string; email: string | null };
   wallet: { smartAccountAddress: string | null; ownerAddress: string | null; spendPermissionsEnabled: boolean };
 };
 
@@ -33,7 +33,7 @@ export async function syncEndUser(endUserInput: unknown): Promise<StockOsSession
       { cdp_user_id: endUser.userId, email, auth_method: "cdp", updated_at: new Date().toISOString() },
       { onConflict: "cdp_user_id" },
     )
-    .select("id,cdp_user_id,email,eligibility_status")
+    .select("id,cdp_user_id,email")
     .single();
   if (profileError || !profile) throw new Error(`Profile sync failed: ${profileError?.message ?? "unknown"}`);
 
@@ -68,7 +68,6 @@ export async function syncEndUser(endUserInput: unknown): Promise<StockOsSession
       id: profile.id,
       cdpUserId: profile.cdp_user_id,
       email: profile.email,
-      eligibilityStatus: profile.eligibility_status,
     },
     wallet: { smartAccountAddress, ownerAddress, spendPermissionsEnabled: !!smartAccountAddress },
   };

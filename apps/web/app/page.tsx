@@ -2,7 +2,7 @@
 
 import { AuthButton } from "@coinbase/cdp-react/components/AuthButton";
 import { useCurrentUser, useGetAccessToken, useIsSignedIn, useSendUserOperation } from "@coinbase/cdp-hooks";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 const sample = "Build me an aggressive AI portfolio with $500. Keep Nvidia below 35% and 10% in cash.";
 const defaultModel = "openai/gpt-5.6-luna";
@@ -25,7 +25,6 @@ export default function Home() {
   const [prompt, setPrompt] = useState(sample);
   const [result, setResult] = useState<any>(null);
   const [executionPlan, setExecutionPlan] = useState<ExecutionPlan | null>(null);
-  const [session, setSession] = useState<any>(null);
   const [aiSettings, setAiSettings] = useState<any>(null);
   const [byokKey, setByokKey] = useState("");
   const [byokModel, setByokModel] = useState(defaultModel);
@@ -48,7 +47,6 @@ export default function Home() {
     if (!isSignedIn) return;
     const response = await authenticatedFetch("/v1/session", { method: "POST" });
     if (!response.ok) throw new Error("Could not establish StockOS session");
-    setSession(await response.json());
     const aiResponse = await authenticatedFetch("/v1/ai/settings");
     if (aiResponse.ok) {
       const settings = await aiResponse.json();
@@ -59,7 +57,9 @@ export default function Home() {
 
   useEffect(() => {
     if (!isSignedIn) {
-      setSession(null); setAiSettings(null); setResult(null); setExecutionPlan(null);
+      setAiSettings(null);
+      setResult(null);
+      setExecutionPlan(null);
       return;
     }
     syncSession().catch(error => setMessage(error.message));
@@ -142,18 +142,17 @@ export default function Home() {
     finally { setLoading(false); }
   }
 
-  const eligibilityLabel = useMemo(() => session?.profile?.eligibilityStatus ?? "unknown", [session]);
   const operationPending = loading || sendStatus === "pending";
 
   return <main>
     <nav><strong>StockOS</strong><div className="nav-right"><span>Base · AI portfolio OS</span><AuthButton /></div></nav>
     <section className="hero">
-      <div><p className="eyebrow">PROGRAMMABLE INVESTING</p><h1>Tell your portfolio<br/>what you want.</h1><p className="lede">Natural language becomes a deterministic, auditable portfolio strategy using tokenized stocks on Base.</p>{isSignedIn && <div className="identity"><span>Smart account</span><code>{smartAddress ?? "Creating…"}</code><span>Eligibility: <b>{eligibilityLabel}</b></span></div>}</div>
+      <div><p className="eyebrow">PROGRAMMABLE INVESTING</p><h1>Tell your portfolio<br/>what you want.</h1><p className="lede">Natural language becomes a deterministic, auditable portfolio strategy using tokenized stocks on Base.</p>{isSignedIn && <div className="identity"><span>Smart account</span><code>{smartAddress ?? "Creating…"}</code></div>}</div>
       <div className="composer"><label>Ask StockOS</label><textarea value={prompt} onChange={event => setPrompt(event.target.value)} /><button onClick={compile} disabled={operationPending || !isSignedIn}>{!isSignedIn ? "Sign in to build" : loading ? "Compiling…" : "Build strategy"}</button><small>AI proposes. StockOS validates. You approve execution.</small></div>
     </section>
     {message && <p className="message">{message}</p>}
     {isSignedIn && <section className="settings"><div><p className="eyebrow">AI LAYER</p><h2>Managed AI or bring your own key.</h2><p>Your model can interpret intent, but it never receives authority to move funds.</p></div><div className="byok"><div className="provider-row"><strong>Current</strong><span>{aiSettings?.provider === "openrouter_byok" ? `OpenRouter BYOK ${aiSettings?.byok?.maskedHint ?? ""}` : "StockOS Managed OpenRouter"}</span></div><input type="password" value={byokKey} onChange={event => setByokKey(event.target.value)} placeholder="OpenRouter API key" autoComplete="off"/><input value={byokModel} onChange={event => setByokModel(event.target.value)} placeholder={defaultModel}/><div className="buttons"><button onClick={saveByok} disabled={operationPending}>Use my key</button><button className="secondary" onClick={useManagedAi} disabled={operationPending}>Use managed AI</button></div></div></section>}
-    {result && <section className="result"><header><div><span>Strategy preview</span><h2>${result.strategy?.totalUsd?.toLocaleString()}</h2><small>{result.ai?.source} · {result.ai?.model}</small></div><span className={result.policy?.allowed ? "pill ok" : "pill"}>{result.policy?.allowed ? "Policy passed" : "Execution gated"}</span></header><div className="grid">{result.strategy?.allocations?.map((allocation: any) => <article key={allocation.asset}><strong>{allocation.asset}</strong><b>{Math.round(allocation.weight * 100)}%</b><span>${allocation.amountUsd}</span></article>)}</div><div className="checks">{result.policy?.checks?.map((check: any) => <span key={check.name} className={check.passed ? "pass" : "fail"}>{check.passed ? "✓" : "×"} {check.name}</span>)}</div><div className="action-row"><button onClick={prepare} disabled={operationPending}>Prepare execution</button><span>StockOS re-reads balances, allowance, token decimals, 0x liquidity and reference prices server-side.</span></div></section>}
+    {result && <section className="result"><header><div><span>Strategy preview</span><h2>${result.strategy?.totalUsd?.toLocaleString()}</h2><small>{result.ai?.source} · {result.ai?.model}</small></div><span className={result.policy?.allowed ? "pill ok" : "pill"}>{result.policy?.allowed ? "Policy passed" : "Execution gated"}</span></header><div className="grid">{result.strategy?.allocations?.map((allocation: any) => <article key={allocation.asset}><strong>{allocation.asset}</strong><b>{Math.round(allocation.weight * 100)}%</b><span>${allocation.amountUsd}</span></article>)}</div><div className="checks">{result.policy?.checks?.map((check: any) => <span key={check.name} className={check.passed ? "pass" : "fail"}>{check.passed ? "✓" : "×"} {check.name}</span>)}</div><div className="action-row"><button onClick={prepare} disabled={operationPending}>Prepare execution</button><span>StockOS re-reads balances, allowance, B20 transfer policy, token decimals, 0x liquidity and reference prices server-side.</span></div></section>}
     {executionPlan && <section className="execution"><header><div><p className="eyebrow">EXECUTION PLAN</p><h2>{executionPlan.phase === "allowance_required" ? "Exact allowance required" : executionPlan.phase === "ready" ? "Ready for your approval" : "Execution blocked"}</h2></div><span className={executionPlan.executable ? "pill ok" : "pill"}>{executionPlan.executable ? "Executable" : "Fail closed"}</span></header><div className="call-list">{executionPlan.calls.map((call, index) => <div key={`${call.kind}-${index}`}><b>{index + 1}. {call.label}</b><code>{call.to}</code></div>)}</div><div className="checks">{executionPlan.checks.map(check => <span key={check.name} className={check.passed ? "pass" : "fail"}>{check.passed ? "✓" : "×"} {check.name}{check.detail ? ` · ${check.detail}` : ""}</span>)}</div>{executionPlan.expiresAt && <p className="note">Firm 0x quote expires at {new Date(executionPlan.expiresAt).toLocaleTimeString()}.</p>}<button className="execute-button" onClick={executePlan} disabled={operationPending || !executionPlan.executable}>{executionPlan.phase === "allowance_required" ? "Approve exact USDC allowance" : "Confirm & invest"}</button><p className="note">This button invokes your CDP Smart Account. The AI never signs or submits this operation.</p></section>}
   </main>;
 }
