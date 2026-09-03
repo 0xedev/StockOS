@@ -2,11 +2,21 @@ import { createPublicClient, encodeFunctionData, formatUnits, http, isAddress, p
 import { base } from "viem/chains";
 import type { SupportedAsset } from "../../../../packages/core/src/types.ts";
 
+const POLICY_REGISTRY = "0x8453000000000000000000000000000000000002" as const;
+
 const erc20Abi = parseAbi([
   "function decimals() view returns (uint8)",
   "function balanceOf(address account) view returns (uint256)",
   "function allowance(address owner,address spender) view returns (uint256)",
   "function approve(address spender,uint256 amount) returns (bool)",
+]);
+const b20Abi = parseAbi([
+  "function isPaused(uint8 feature) view returns (bool)",
+  "function TRANSFER_RECEIVER_POLICY() view returns (bytes32)",
+  "function policyId(bytes32 policyScope) view returns (uint64)",
+]);
+const policyRegistryAbi = parseAbi([
+  "function isAuthorized(uint64 policyId,address account) view returns (bool)",
 ]);
 const aggregatorAbi = parseAbi([
   "function decimals() view returns (uint8)",
@@ -44,6 +54,39 @@ export async function readAllowance(token: string, owner: string, spender: strin
 
 export function encodeExactApproval(spender: string, amount: bigint): `0x${string}` {
   return encodeFunctionData({ abi: erc20Abi, functionName: "approve", args: [address(spender, "spender"), amount] });
+}
+
+export type B20ReceiveSafety = {
+  transferPaused: boolean;
+  receiverPolicyId: bigint;
+  receiverAuthorized: boolean;
+};
+
+// StockOS currently prepares BUY flows, so the user Smart Account is the B20 transfer receiver.
+// 0x simulation still validates the complete route; this explicit read catches receiver-policy and
+// token pause failures before we ever present a firm quote for approval.
+export async function readB20ReceiveSafety(token: string, receiver: string): Promise<B20ReceiveSafety> {
+  const tokenAddress = address(token, "B20 token");
+  const receiverAddress = address(receiver, "receiver");
+  const [transferPaused, receiverScope] = await Promise.all([
+    getBaseClient().readContract({ address: tokenAddress, abi: b20Abi, functionName: "isPaused", args: [0] }), // PausableFeature.TRANSFER
+    getBaseClient().readContract({ address: tokenAddress, abi: b20Abi, functionName: "TRANSFER_RECEIVER_POLICY" }),
+  ]);
+  const receiverPolicyId = await getBaseClient().readContract({
+    address: tokenAddress,
+    abi: b20Abi,
+    functionName: "policyId",
+    args: [receiverScope],
+  });
+  const receiverAuthorized = receiverPolicyId === 0n
+    ? true
+    : await getBaseClient().readContract({
+        address: POLICY_REGISTRY,
+        abi: policyRegistryAbi,
+        functionName: "isAuthorized",
+        args: [receiverPolicyId, receiverAddress],
+      });
+  return { transferPaused, receiverPolicyId, receiverAuthorized };
 }
 
 function feedEnvName(asset: SupportedAsset): string {
