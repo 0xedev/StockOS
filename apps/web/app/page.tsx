@@ -33,6 +33,12 @@ type ExecutionPlan = {
   checks: Array<{ name: string; passed: boolean; detail?: string }>;
 };
 
+type PendingExecutionSubmission = {
+  planId: string;
+  phase: "allowance_required" | "ready";
+  userOperationHash: string;
+};
+
 type WalletSummary = {
   address: string;
   network: "base";
@@ -95,10 +101,11 @@ export default function Home() {
   const { isSignedIn } = useIsSignedIn();
   const { currentUser } = useCurrentUser();
   const { getAccessToken } = useGetAccessToken();
-  const { sendUserOperation, status: sendStatus } = useSendUserOperation();
+  const { sendUserOperation, status: sendStatus, data: sendData, error: sendError } = useSendUserOperation();
   const [prompt, setPrompt] = useState("");
   const [result, setResult] = useState<any>(null);
   const [executionPlan, setExecutionPlan] = useState<ExecutionPlan | null>(null);
+  const [pendingExecution, setPendingExecution] = useState<PendingExecutionSubmission | null>(null);
   const [portfolioState, setPortfolioState] = useState<PortfolioState | null>(null);
   const [session, setSession] = useState<any>(null);
   const [walletSummary, setWalletSummary] = useState<WalletSummary | null>(null);
@@ -178,6 +185,7 @@ export default function Home() {
       setPortfolioState(null);
       setResult(null);
       setExecutionPlan(null);
+      setPendingExecution(null);
       return;
     }
     syncSession().catch(error => setMessage(error.message));
@@ -250,11 +258,10 @@ export default function Home() {
         calls: [{ to: prepared.call.to as `0x${string}`, data: prepared.call.data as `0x${string}`, value: BigInt(prepared.call.value) }],
         useCdpPaymaster: true,
       });
-      const reference = (sent as any)?.transactionHash ?? (sent as any)?.userOperationHash ?? (sent as any)?.hash;
-      if (!reference) throw new Error("CDP did not return a transaction or user-operation reference");
-      setMessage(`${prepared.amount} ${prepared.asset} send submitted: ${reference}`);
+      const reference = (sent as any)?.userOperationHash ?? (sent as any)?.userOpHash ?? (sent as any)?.hash;
+      if (!reference) throw new Error("CDP did not return a user-operation reference");
+      setMessage(`${prepared.amount} ${prepared.asset} send started: ${reference}`);
       setSendAmount("");
-      await refreshWallet().catch(() => undefined);
     } catch (error) { setMessage(error instanceof Error ? error.message : "Wallet send failed"); }
     finally { setLoading(false); }
   }
@@ -290,36 +297,77 @@ export default function Home() {
   }
 
   async function executePlan() {
-    if (!executionPlan?.executable || !cdpSmartAccount) return;
+    if (!executionPlan?.executable || !cdpSmartAccount || executionPlan.phase === "blocked") return;
     if (executionPlan.expiresAt && Date.now() > Date.parse(executionPlan.expiresAt)) {
       setMessage("The quote expired. Prepare a fresh execution plan."); setExecutionPlan(null); return;
     }
     setLoading(true); setMessage("");
     try {
+      const planId = executionPlan.planId;
+      const phase = executionPlan.phase;
       const sent = await sendUserOperation({
         evmSmartAccount: cdpSmartAccount,
         network: "base",
         calls: executionPlan.calls.map(call => ({ to: call.to as `0x${string}`, data: call.data as `0x${string}`, value: BigInt(call.value) })),
         useCdpPaymaster: true,
       });
-      const transactionHash = (sent as any)?.transactionHash;
-      if (!transactionHash) throw new Error("CDP completed the user operation without returning a transaction hash. Refresh and retry before continuing.");
-      const submittedResponse = await authenticatedFetch(`/v1/execution/${executionPlan.planId}/submitted`, { method: "POST", body: JSON.stringify({ transactionHash }) });
-      const submittedBody = await submittedResponse.json();
-      if (!submittedResponse.ok) throw new Error(submittedBody.message ?? submittedBody.error ?? "Could not record submitted transaction");
-
-      if (executionPlan.phase === "allowance_required") {
-        setMessage("Exact USDC allowance confirmed. StockOS is rebuilding fresh quotes before the trade.");
-        setExecutionPlan(null);
-        await prepare();
-      } else {
-        setMessage("Portfolio transaction submitted. StockOS is monitoring Base until it confirms.");
-        setExecutionPlan(null);
-        await Promise.all([refreshPortfolio().catch(() => undefined), refreshWallet().catch(() => undefined)]);
-      }
-    } catch (error) { setMessage(error instanceof Error ? error.message : "User operation failed"); }
-    finally { setLoading(false); }
+      const userOperationHash = (sent as any)?.userOperationHash ?? (sent as any)?.userOpHash;
+      if (!userOperationHash) throw new Error("CDP did not return a user-operation hash");
+      setPendingExecution({ planId, phase, userOperationHash });
+      setExecutionPlan(null);
+      setMessage(phase === "allowance_required"
+        ? "Allowance approval submitted. Waiting for Coinbase to confirm the user operation on Base."
+        : "Portfolio transaction submitted to Coinbase. Waiting for the Base transaction hash before handing monitoring to StockOS.");
+    } catch (error) {
+      setLoading(false);
+      setMessage(error instanceof Error ? error.message : "User operation failed");
+    }
   }
+
+  useEffect(() => {
+    if (!pendingExecution) return;
+    if (sendStatus === "error") {
+      setMessage(sendError?.message ?? "Coinbase could not complete the user operation.");
+      setPendingExecution(null);
+      setLoading(false);
+      return;
+    }
+    if (sendStatus !== "success" || !sendData) return;
+
+    const data = sendData as any;
+    const trackedHash = data.userOperationHash ?? data.userOpHash;
+    if (trackedHash && trackedHash.toLowerCase() !== pendingExecution.userOperationHash.toLowerCase()) return;
+    const transactionHash = data.transactionHash;
+    if (!transactionHash) return;
+
+    let cancelled = false;
+    const submission = pendingExecution;
+    setPendingExecution(null);
+    void (async () => {
+      try {
+        const submittedResponse = await authenticatedFetch(`/v1/execution/${submission.planId}/submitted`, {
+          method: "POST",
+          body: JSON.stringify({ transactionHash }),
+        });
+        const submittedBody = await submittedResponse.json();
+        if (!submittedResponse.ok) throw new Error(submittedBody.message ?? submittedBody.error ?? "Could not record submitted transaction");
+        if (cancelled) return;
+
+        if (submission.phase === "allowance_required") {
+          setMessage("Exact USDC allowance confirmed. StockOS is rebuilding fresh 0x quotes before the trade.");
+          await prepare();
+        } else {
+          setMessage("Portfolio transaction is on Base. StockOS is now monitoring it independently until confirmation.");
+          await Promise.all([refreshPortfolio().catch(() => undefined), refreshWallet().catch(() => undefined)]);
+        }
+      } catch (error) {
+        if (!cancelled) setMessage(error instanceof Error ? error.message : "Could not hand the transaction to StockOS monitoring");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [authenticatedFetch, pendingExecution, refreshPortfolio, refreshWallet, sendData, sendError, sendStatus]);
 
   async function saveByok() {
     if (!byokKey.trim()) return setMessage(`Enter your ${providerLabels[byokProvider]} API key first.`);
@@ -348,7 +396,7 @@ export default function Home() {
     finally { setLoading(false); }
   }
 
-  const operationPending = loading || compiling || sendStatus === "pending";
+  const operationPending = loading || compiling || sendStatus === "pending" || !!pendingExecution;
   const countryReady = /^[A-Z]{2}$/.test(fundCountry) && (fundCountry !== "US" || !!fundSubdivision.trim());
   const availableUsdc = Number(walletSummary?.balances.USDC.formatted ?? 0);
   const usdcBalance = availableUsdc.toLocaleString(undefined, { maximumFractionDigits: 6 });
@@ -379,6 +427,8 @@ export default function Home() {
     {result && <section className="result"><header><div><span>Strategy preview</span><h2>${result.strategy?.totalUsd?.toLocaleString()}</h2><small>{result.ai?.source === "managed" ? "Managed AI" : result.ai?.source === "byok" ? "Your AI provider" : result.ai?.source === "deterministic_fallback" ? "Deterministic fallback" : "StockOS parser"}</small></div><span className={result.policy?.allowed ? "pill ok" : "pill"}>{result.policy?.allowed ? "Policy passed" : "Review required"}</span></header><div className="grid">{result.strategy?.allocations?.map((allocation: any) => <article key={allocation.asset}><strong>{allocation.asset}</strong><b>{(allocation.weight * 100).toFixed((allocation.weight * 100) % 1 ? 1 : 0)}%</b><span>${allocation.amountUsd}</span></article>)}</div>{result.strategy?.warnings?.length > 0 && <div className="warnings">{result.strategy.warnings.map((warning: string) => <p key={warning}>{warning}</p>)}</div>}<div className="checks">{result.policy?.checks?.map((check: any) => <span key={check.name} className={check.passed ? "pass" : "fail"}>{check.passed ? "✓" : "×"} {check.name}</span>)}</div><div className="next-step"><div><strong>{requiredUsdc <= 0 ? "No stock trade is required" : fundingShortfall > 0 ? `${formatUsd(fundingShortfall)} more USDC needed` : "Ready for execution review"}</strong><span>{requiredUsdc <= 0 ? "This strategy is entirely cash." : fundingShortfall > 0 ? `Your Smart Account has ${formatUsd(availableUsdc)}. Fund it, then StockOS will build live 0x quotes.` : "StockOS will now check live balances, B20 policy, liquidity, allowance and reference pricing."}</span></div><button className="execution-cta" onClick={() => fundingShortfall > 0 ? setWalletOpen(true) : void prepare()} disabled={operationPending || !result.policy?.allowed || requiredUsdc <= 0}>{requiredUsdc <= 0 ? "No trade required" : fundingShortfall > 0 ? "Fund wallet to continue" : loading ? "Preparing execution…" : "Review & invest"}</button></div></section>}
 
     {executionPlan && <section className="execution"><header><div><p className="eyebrow">EXECUTION PLAN</p><h2>{executionPlan.phase === "allowance_required" ? "Step 1 · Exact allowance" : executionPlan.phase === "ready" ? "Step 2 · Ready to invest" : "Execution blocked"}</h2></div><span className={executionPlan.executable ? "pill ok" : "pill"}>{executionPlan.executable ? "Checks passed" : "Fail closed"}</span></header><div className="call-list">{executionPlan.calls.map((call,index) => <div key={`${call.kind}-${index}`}><b>{index+1}. {call.label}</b><code>{call.to}</code></div>)}</div><div className="checks">{executionPlan.checks.map(check => <span key={check.name} className={check.passed ? "pass" : "fail"}>{check.passed ? "✓" : "×"} {check.name}{check.detail ? ` · ${check.detail}` : ""}</span>)}</div>{executionPlan.expiresAt && <p className="note">Firm 0x quote expires at {new Date(executionPlan.expiresAt).toLocaleTimeString()}.</p>}<button className="execute-button" onClick={executePlan} disabled={operationPending || !executionPlan.executable}>{executionPlan.phase === "allowance_required" ? "Approve exact USDC allowance" : "Confirm & invest"}</button><p className="note">Your CDP Smart Account submits this operation only after you approve it. The AI never signs transactions.</p></section>}
+
+    {pendingExecution && <section className="lifecycle-card pending"><div><p className="eyebrow">COINBASE USER OPERATION</p><h2>Waiting for the Base transaction.</h2><p>Coinbase is tracking the signed Smart Account operation. As soon as it produces the transaction hash, StockOS will persist it and the Railway worker takes over monitoring.</p></div><div className="lifecycle-side"><span className="status-dot">{sendStatus === "success" ? "Finalizing" : "Pending"}</span><code>{pendingExecution.userOperationHash.slice(0, 12)}…</code></div></section>}
 
     {executionPending && <section className="lifecycle-card pending"><div><p className="eyebrow">EXECUTION</p><h2>Portfolio transaction is confirming.</h2><p>StockOS is watching Base independently of this browser. You can close the page and the worker will keep reconciling the receipt.</p></div><div className="lifecycle-side"><span className="status-dot">Confirming</span>{portfolioState?.execution?.transactionHash && <a href={`https://basescan.org/tx/${portfolioState.execution.transactionHash}`} target="_blank" rel="noreferrer">View on BaseScan</a>}</div></section>}
 
