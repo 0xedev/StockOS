@@ -1,7 +1,9 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { formatEther, formatUnits, parseEther, parseUnits } from "viem";
-import { demoIntent, OpenRouterRequestError, parseIntentWithOpenRouter } from "../../../packages/ai/src/openrouter.ts";
+import { OpenRouterRequestError } from "../../../packages/ai/src/openrouter.ts";
+import { parseIntentWithOpenRouterCompatible } from "../../../packages/ai/src/openrouter-compatible.ts";
+import { deterministicIntentV3 } from "../../../packages/ai/src/deterministic-v3.ts";
 import { ASSETS } from "../../../packages/b20/src/registry.ts";
 import { compileStrategy } from "../../../packages/strategy/src/compiler.ts";
 import { evaluatePolicy } from "../../../packages/policy/src/engine.ts";
@@ -19,6 +21,8 @@ await app.register(cors, {
     if (!origin || allowedOrigins.has(origin)) return callback(null, true);
     callback(new Error("Origin not allowed"), false);
   },
+  methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Authorization", "Content-Type"],
 });
 
 app.get("/health", async () => ({ ok: true, service: "stockos-api" }));
@@ -166,22 +170,22 @@ app.post("/v1/strategy/compile", async (request, reply) => {
   let fallbackReason: string | null = null;
   try {
     if (runtime.apiKey) {
-      const parsed = await parseIntentWithOpenRouter(prompt, runtime.apiKey, runtime.model);
+      const parsed = await parseIntentWithOpenRouterCompatible(prompt, runtime.apiKey, runtime.model);
       intent = parsed.intent;
       effectiveModel = parsed.model;
     } else {
-      intent = demoIntent(prompt);
+      intent = deterministicIntentV3(prompt);
       effectiveSource = "deterministic_demo";
-      effectiveModel = "deterministic-parser-v2";
+      effectiveModel = "deterministic-parser-v3";
     }
   } catch (error) {
     if (error instanceof OpenRouterRequestError && runtime.source === "managed") {
       try {
-        intent = demoIntent(prompt);
+        intent = deterministicIntentV3(prompt);
         effectiveSource = "deterministic_fallback";
-        effectiveModel = "deterministic-parser-v2";
+        effectiveModel = "deterministic-parser-v3";
         fallbackReason = `${error.status}:${error.message}`;
-        request.log.warn({ status: error.status, requestedModel: runtime.model }, "managed AI unavailable; deterministic parser used");
+        request.log.warn({ status: error.status, reason: error.message, requestedModel: runtime.model }, "managed AI unavailable; deterministic parser used");
       } catch (fallbackError) {
         return reply.code(503).send({ error: "strategy_interpretation_failed", message: fallbackError instanceof Error ? fallbackError.message : "Could not interpret this strategy", requestedModel: runtime.model });
       }
