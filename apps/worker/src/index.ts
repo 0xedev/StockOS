@@ -48,6 +48,16 @@ function feedEnv(asset: StockAsset) {
   return `CHAINLINK_FEED_${asset.toUpperCase()}`;
 }
 
+function nextRebalanceFrom(frequency: unknown, from = new Date()): string | null {
+  if (typeof frequency !== "string") return null;
+  const next = new Date(from);
+  if (frequency === "WEEKLY") next.setUTCDate(next.getUTCDate() + 7);
+  else if (frequency === "MONTHLY") next.setUTCMonth(next.getUTCMonth() + 1);
+  else if (frequency === "QUARTERLY") next.setUTCMonth(next.getUTCMonth() + 3);
+  else return null;
+  return next.toISOString();
+}
+
 async function referencePrice(asset: TrackedAsset): Promise<{ priceUsd: number | null; updatedAt: string | null }> {
   if (asset === "USDC") return { priceUsd: 1, updatedAt: new Date().toISOString() };
   const feed = process.env[feedEnv(asset)];
@@ -154,9 +164,26 @@ async function capturePortfolioSnapshot(userId: string, strategyId: string) {
 }
 
 async function activateStrategy(userId: string, strategyId: string, strategyVersion: number) {
-  const now = new Date().toISOString();
+  const activatedAt = new Date();
+  const now = activatedAt.toISOString();
   await db.from("strategies").update({ status: "paused", updated_at: now }).eq("user_id", userId).eq("status", "active").neq("id", strategyId);
   await db.from("strategies").update({ status: "active", updated_at: now }).eq("id", strategyId);
+
+  const { data: rebalanceRules, error: rulesError } = await db
+    .from("automation_rules")
+    .select("id,parameters")
+    .eq("strategy_id", strategyId)
+    .eq("rule_type", "scheduled_rebalance")
+    .eq("enabled", true);
+  if (rulesError) throw new Error(`Could not load rebalance rules: ${rulesError.message}`);
+  for (const rule of rebalanceRules ?? []) {
+    const frequency = (rule.parameters as any)?.frequency;
+    const nextRunAt = nextRebalanceFrom(frequency, activatedAt);
+    if (!nextRunAt) continue;
+    const { error } = await db.from("automation_rules").update({ next_run_at: nextRunAt, updated_at: now }).eq("id", rule.id);
+    if (error) throw new Error(`Could not schedule rebalance from activation: ${error.message}`);
+  }
+
   await db.from("audit_events").insert({
     user_id: userId,
     strategy_id: strategyId,
