@@ -40,6 +40,7 @@ export default function Home() {
   const [executionPlan, setExecutionPlan] = useState<ExecutionPlan | null>(null);
   const [session, setSession] = useState<any>(null);
   const [walletSummary, setWalletSummary] = useState<WalletSummary | null>(null);
+  const [walletOpen, setWalletOpen] = useState(false);
   const [sendAsset, setSendAsset] = useState<"USDC" | "ETH">("USDC");
   const [sendTo, setSendTo] = useState("");
   const [sendAmount, setSendAmount] = useState("");
@@ -93,11 +94,26 @@ export default function Home() {
 
   useEffect(() => {
     if (!isSignedIn) {
+      setWalletOpen(false);
       setSession(null); setWalletSummary(null); setAiSettings(null); setResult(null); setExecutionPlan(null);
       return;
     }
     syncSession().catch(error => setMessage(error.message));
   }, [isSignedIn, currentUser?.userId, syncSession]);
+
+  useEffect(() => {
+    if (!walletOpen) return;
+    const previousOverflow = document.body.style.overflow;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setWalletOpen(false);
+    };
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [walletOpen]);
 
   useEffect(() => {
     if (fundCountry || typeof navigator === "undefined") return;
@@ -233,20 +249,50 @@ export default function Home() {
   const ethBalance = Number(walletSummary?.balances.ETH.formatted ?? 0).toLocaleString(undefined, { maximumFractionDigits: 6 });
 
   return <main>
-    <nav><strong>StockOS</strong><div className="nav-right"><span>Base · AI portfolio OS</span><AuthButton /></div></nav>
+    <nav>
+      <strong>StockOS</strong>
+      <div className="nav-right">
+        <span>Base · AI portfolio OS</span>
+        {isSignedIn ? <button type="button" className="wallet-trigger" onClick={() => setWalletOpen(true)}>Wallet</button> : <AuthButton />}
+      </div>
+    </nav>
+
     <section className="hero">
       <div><p className="eyebrow">PROGRAMMABLE INVESTING</p><h1>Tell your portfolio<br/>what you want.</h1><p className="lede">Type the allocation, constraints, risk profile or plain-English goal. StockOS turns it into a validated portfolio using tokenized stocks on Base.</p>{isSignedIn && <div className="identity"><span>Smart account</span><code>{smartAddress ?? "Creating…"}</code></div>}</div>
       <div className="composer"><label>Describe your strategy</label><textarea value={prompt} onChange={event => setPrompt(event.target.value)} placeholder="e.g. Invest $1,000: 50% Apple, 30% Nvidia and 20% cash."/><div className="examples">{examples.map(example => <button type="button" key={example} onClick={() => setPrompt(example)}>{example}</button>)}</div><button className="primary" onClick={compile} disabled={operationPending || !isSignedIn || !prompt.trim()}>{!isSignedIn ? "Sign in to build" : compiling ? "Compiling your strategy…" : "Build my strategy"}</button><small>AI proposes actual weights. StockOS validates allowed assets and constraints. You approve execution.</small></div>
     </section>
+
     {message && <p className="message">{message}</p>}
 
-    {isSignedIn && <section className="wallet-panel">
-      <div><p className="eyebrow">YOUR BASE WALLET</p><h2>Your wallet should be usable, not just visible.</h2><p>The Smart Account holds and trades your assets. Its owner EOA is the exportable key that controls it.</p><div className="balance-grid"><div><span>USDC</span><strong>{usdcBalance}</strong></div><div><span>ETH</span><strong>{ethBalance}</strong></div></div><div className="wallet-address"><span>Smart Account</span><code>{smartAddress ?? "Creating…"}</code></div>{ownerAddress && <div className="wallet-address"><span>Owner EOA</span><code>{ownerAddress}</code></div>}<div className="buttons wallet-top-actions"><button onClick={copyReceiveAddress} disabled={!smartAddress}>Receive / copy address</button><button className="secondary-action" onClick={() => refreshWallet().catch(error => setMessage(error.message))} disabled={operationPending}>Refresh balances</button>{smartAddress && <a className="button-link" href={`https://basescan.org/address/${smartAddress}`} target="_blank" rel="noreferrer">BaseScan</a>}</div></div>
-      <div className="wallet-actions">
-        <div className="wallet-box"><strong>Fund wallet</strong><p>Buy USDC into this Smart Account with Coinbase Onramp, where available.</p><div className="fund-config"><label>Country code<input value={fundCountry} maxLength={2} onChange={event => setFundCountry(event.target.value.toUpperCase())} placeholder="NG"/></label>{fundCountry === "US" && <label>State code<input value={fundSubdivision} maxLength={3} onChange={event => setFundSubdivision(event.target.value.toUpperCase())} placeholder="NY"/></label>}</div><div className="buttons">{countryReady && smartAddress ? <FundModal country={fundCountry} subdivision={fundSubdivision || undefined} cryptoCurrency="usdc" fiatCurrency="usd" fetchBuyQuote={fetchBuyQuote} fetchBuyOptions={fetchBuyOptions} network="base" destinationAddress={smartAddress} presetAmountInputs={[25,50,100]} title="Fund your StockOS wallet" onSuccess={() => { setMessage("Funding completed. Refreshing wallet balance."); refreshWallet().catch(() => undefined); }} onError={() => setMessage("Coinbase funding is unavailable for this country, account, or payment method.")} /> : <button disabled>{!smartAddress ? "Smart Account is still being created" : "Enter country code to fund"}</button>}{ownerAddress && <ExportWalletModal address={ownerAddress} onCopySuccess={() => setMessage("Owner private key copied through Coinbase's secure export flow. StockOS never receives it.")} onIframeError={error => setMessage(error ?? "Wallet export failed")}><button type="button" className="secondary-action">Export owner key</button></ExportWalletModal>}</div><small>You can always fund directly by sending Base USDC or ETH to the Smart Account address.</small></div>
-        <div className="wallet-box"><strong>Send / withdraw</strong><p>Prepare a deterministic transfer, then approve it with your CDP Smart Account.</p><div className="send-row"><select value={sendAsset} onChange={event => setSendAsset(event.target.value as "USDC" | "ETH")}><option value="USDC">USDC</option><option value="ETH">ETH</option></select><input value={sendAmount} onChange={event => setSendAmount(event.target.value)} inputMode="decimal" placeholder="Amount"/></div><input value={sendTo} onChange={event => setSendTo(event.target.value)} placeholder="0x recipient address"/><button onClick={sendWalletAsset} disabled={operationPending || !sendAmount.trim() || !sendTo.trim()}>Review & send {sendAsset}</button><small>The AI cannot call this action. The backend only prepares transfer calldata after you enter the destination and amount.</small></div>
-      </div>
-    </section>}
+    {isSignedIn && walletOpen && <div className="wallet-modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setWalletOpen(false); }}>
+      <section className="wallet-modal" role="dialog" aria-modal="true" aria-labelledby="wallet-modal-title">
+        <header className="wallet-modal-header">
+          <div><p className="eyebrow">YOUR BASE WALLET</p><h2 id="wallet-modal-title">Wallet</h2></div>
+          <button type="button" className="wallet-modal-close" aria-label="Close wallet" onClick={() => setWalletOpen(false)}>×</button>
+        </header>
+
+        <div className="wallet-panel wallet-panel-modal">
+          <div>
+            <h2>Your assets</h2>
+            <p>The Smart Account holds and trades your assets. Its owner EOA is the exportable key that controls it.</p>
+            <div className="balance-grid"><div><span>USDC</span><strong>{usdcBalance}</strong></div><div><span>ETH</span><strong>{ethBalance}</strong></div></div>
+            <div className="wallet-address"><span>Smart Account</span><code>{smartAddress ?? "Creating…"}</code></div>
+            {ownerAddress && <div className="wallet-address"><span>Owner EOA</span><code>{ownerAddress}</code></div>}
+            <div className="buttons wallet-top-actions"><button onClick={copyReceiveAddress} disabled={!smartAddress}>Receive / copy address</button><button className="secondary-action" onClick={() => refreshWallet().catch(error => setMessage(error.message))} disabled={operationPending}>Refresh balances</button>{smartAddress && <a className="button-link" href={`https://basescan.org/address/${smartAddress}`} target="_blank" rel="noreferrer">BaseScan</a>}</div>
+          </div>
+
+          <div className="wallet-actions">
+            <div className="wallet-box"><strong>Fund wallet</strong><p>Buy USDC into this Smart Account with Coinbase Onramp, where available.</p><div className="fund-config"><label>Country code<input value={fundCountry} maxLength={2} onChange={event => setFundCountry(event.target.value.toUpperCase())} placeholder="NG"/></label>{fundCountry === "US" && <label>State code<input value={fundSubdivision} maxLength={3} onChange={event => setFundSubdivision(event.target.value.toUpperCase())} placeholder="NY"/></label>}</div><div className="buttons">{countryReady && smartAddress ? <FundModal country={fundCountry} subdivision={fundSubdivision || undefined} cryptoCurrency="usdc" fiatCurrency="usd" fetchBuyQuote={fetchBuyQuote} fetchBuyOptions={fetchBuyOptions} network="base" destinationAddress={smartAddress} presetAmountInputs={[25,50,100]} title="Fund your StockOS wallet" onSuccess={() => { setMessage("Funding completed. Refreshing wallet balance."); refreshWallet().catch(() => undefined); }} onError={() => setMessage("Coinbase funding is unavailable for this country, account, or payment method.")} /> : <button disabled>{!smartAddress ? "Smart Account is still being created" : "Enter country code to fund"}</button>}{ownerAddress && <ExportWalletModal address={ownerAddress} onCopySuccess={() => setMessage("Owner private key copied through Coinbase's secure export flow. StockOS never receives it.")} onIframeError={error => setMessage(error ?? "Wallet export failed")}><button type="button" className="secondary-action">Export owner key</button></ExportWalletModal>}</div><small>You can always fund directly by sending Base USDC or ETH to the Smart Account address.</small></div>
+            <div className="wallet-box"><strong>Send / withdraw</strong><p>Prepare a deterministic transfer, then approve it with your CDP Smart Account.</p><div className="send-row"><select value={sendAsset} onChange={event => setSendAsset(event.target.value as "USDC" | "ETH")}><option value="USDC">USDC</option><option value="ETH">ETH</option></select><input value={sendAmount} onChange={event => setSendAmount(event.target.value)} inputMode="decimal" placeholder="Amount"/></div><input value={sendTo} onChange={event => setSendTo(event.target.value)} placeholder="0x recipient address"/><button onClick={sendWalletAsset} disabled={operationPending || !sendAmount.trim() || !sendTo.trim()}>Review & send {sendAsset}</button><small>The AI cannot call this action. The backend only prepares transfer calldata after you enter the destination and amount.</small></div>
+          </div>
+        </div>
+
+        <footer className="wallet-modal-footer">
+          <div><strong>Account</strong><span>Signed in with Coinbase CDP</span></div>
+          <AuthButton />
+        </footer>
+      </section>
+    </div>}
 
     {isSignedIn && <section className="settings"><div><p className="eyebrow">AI LAYER</p><h2>Managed AI or bring your own key.</h2><p>The model proposes actual target weights instead of selecting a hardcoded theme. Token addresses and transaction calldata stay deterministic and outside the model.</p></div><div className="byok"><div className="provider-row"><strong>Current</strong><span>{aiSettings?.provider === "openrouter_byok" ? `OpenRouter BYOK ${aiSettings?.byok?.maskedHint ?? ""}` : `Managed · ${aiSettings?.managedModel ?? aiSettings?.model ?? defaultModel}`}</span></div><input type="password" value={byokKey} onChange={event => setByokKey(event.target.value)} placeholder="OpenRouter API key" autoComplete="off"/><input value={byokModel} onChange={event => setByokModel(event.target.value)} placeholder={defaultModel}/><div className="buttons"><button onClick={saveByok} disabled={operationPending}>Use my key</button><button className="secondary-action" onClick={useManagedAi} disabled={operationPending}>Use managed AI</button></div></div></section>}
 
