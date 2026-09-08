@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { formatUnits, isAddress } from "viem";
 import { ASSETS } from "../../../../packages/b20/src/registry.ts";
-import type { CompiledStrategy, InvestmentIntent, SupportedAsset } from "../../../../packages/core/src/types.ts";
+import type { CompiledStrategy, SupportedAsset } from "../../../../packages/core/src/types.ts";
 import { ZeroXClient, type ZeroXSwapResponse } from "../../../../packages/execution/src/zerox.ts";
 import { encodeExactApproval, readAllowance, readB20ReceiveSafety, readReferencePrice, readTokenBalance, readTokenDecimals } from "./chain.ts";
 import { getAdminSupabase } from "./db.ts";
@@ -24,7 +24,7 @@ type PriceWork = {
   sellAmount: bigint;
   tokenAddress: string;
   response: ZeroXSwapResponse;
-  allowanceTarget: string;
+  allowanceTarget: string | null;
   b20Safety: { transferPaused: boolean; receiverPolicyId: bigint; receiverAuthorized: boolean };
 };
 
@@ -33,15 +33,17 @@ function usdcRaw(amountUsd: number): bigint {
   return BigInt(Math.round(amountUsd * 10 ** USDC_DECIMALS));
 }
 
-function targetFrom(response: ZeroXSwapResponse): string {
+function targetFrom(response: ZeroXSwapResponse): string | null {
   const target = response.issues?.allowance?.spender ?? response.allowanceTarget;
-  if (!target || !isAddress(target)) throw new ExecutionPreparationError("invalid_0x_allowance_target", "0x did not return a valid AllowanceHolder target", 502);
-  return target;
+  return target && isAddress(target) ? target : null;
 }
 
 function assertPriceResponse(response: ZeroXSwapResponse, asset: SupportedAsset) {
   if (response.liquidityAvailable === false) throw new ExecutionPreparationError("liquidity_unavailable", `No 0x liquidity is available for ${asset}`, 409);
-  if (response.issues?.balance) throw new ExecutionPreparationError("insufficient_usdc", "Smart account does not have enough USDC for this strategy", 409);
+  if (!response.buyAmount || BigInt(response.buyAmount) <= 0n) throw new ExecutionPreparationError("invalid_buy_amount", `0x returned no indicative buy amount for ${asset}`, 502);
+  // A /price response can legitimately report an insufficient balance while still
+  // providing useful live route/pricing data. Funding is evaluated after all price
+  // legs have been discovered so users can inspect the market before depositing.
 }
 
 function assertFirmQuote(response: ZeroXSwapResponse, expectedTarget: string, asset: SupportedAsset) {
@@ -119,23 +121,78 @@ export async function prepareExecution(input: { userId: string; smartAccountAddr
     const sellAmount = usdcRaw(allocation.amountUsd);
     const response = await zeroX.price({ sellToken: USDC, buyToken: record.address, sellAmount: sellAmount.toString(), taker: input.smartAccountAddress, slippageBps: 50 });
     assertPriceResponse(response, allocation.asset);
-    priceWork.push({ asset: allocation.asset, allocationUsd: allocation.amountUsd, sellAmount, tokenAddress: record.address, response, allowanceTarget: targetFrom(response), b20Safety });
+    priceWork.push({
+      asset: allocation.asset,
+      allocationUsd: allocation.amountUsd,
+      sellAmount,
+      tokenAddress: record.address,
+      response,
+      allowanceTarget: targetFrom(response),
+      b20Safety,
+    });
   }
 
-  const allowanceTargets = new Set(priceWork.map(work => work.allowanceTarget.toLowerCase()));
-  if (allowanceTargets.size !== 1) throw new ExecutionPreparationError("allowance_target_mismatch", "0x returned inconsistent allowance targets", 409);
-  const allowanceTarget = priceWork[0].allowanceTarget;
   const totalSell = priceWork.reduce((sum, work) => sum + work.sellAmount, 0n);
-  const [balance, allowance] = await Promise.all([
-    readTokenBalance(USDC, input.smartAccountAddress),
-    readAllowance(USDC, input.smartAccountAddress, allowanceTarget),
-  ]);
-  if (balance < totalSell) throw new ExecutionPreparationError("insufficient_usdc", `Strategy needs ${formatUnits(totalSell, USDC_DECIMALS)} USDC but the smart account balance is lower`, 409);
-
+  const totalPortfolioUsd = compiled.allocations.reduce((sum, allocation) => sum + Number(allocation.amountUsd ?? 0), 0);
+  const requiredCapital = usdcRaw(totalPortfolioUsd);
+  const balance = await readTokenBalance(USDC, input.smartAccountAddress);
   const b20Checks: PlanCheck[] = priceWork.flatMap(work => [
     { name: `b20_transfer_unpaused:${work.asset}`, passed: !work.b20Safety.transferPaused },
     { name: `b20_receiver_authorized:${work.asset}`, passed: work.b20Safety.receiverAuthorized, detail: `receiver policy ${work.b20Safety.receiverPolicyId.toString()}` },
+    { name: `zerox_liquidity:${work.asset}`, passed: true, detail: "Live 0x indicative pricing available" },
   ]);
+
+  const indicativePricing = await Promise.all(priceWork.map(async work => {
+    const tokenDecimals = await readTokenDecimals(work.tokenAddress);
+    const buyAmount = work.response.buyAmount!;
+    const buyQuantity = Number(formatUnits(BigInt(buyAmount), tokenDecimals));
+    return {
+      asset: work.asset,
+      sellUsd: work.allocationUsd,
+      buyAmount,
+      tokenDecimals,
+      buyQuantity: Number.isFinite(buyQuantity) ? buyQuantity : null,
+      routeAvailable: !!work.response.route,
+      balanceIssue: !!work.response.issues?.balance,
+    };
+  }));
+
+  if (balance < requiredCapital) {
+    const fundingShortfall = requiredCapital - balance;
+    const checks: PlanCheck[] = [
+      { name: "asset_registry", passed: true },
+      ...b20Checks,
+      {
+        name: "usdc_funding",
+        passed: false,
+        detail: `${formatUnits(balance, USDC_DECIMALS)} / ${formatUnits(requiredCapital, USDC_DECIMALS)} USDC funded; ${formatUnits(fundingShortfall, USDC_DECIMALS)} USDC still needed`,
+      },
+    ];
+    const plan = {
+      phase: "funding_required",
+      strategyVersionId: version.id,
+      requiredCapital: requiredCapital.toString(),
+      requiredStockSpend: totalSell.toString(),
+      currentBalance: balance.toString(),
+      fundingShortfall: fundingShortfall.toString(),
+      pricingType: "indicative_0x_price",
+      pricing: indicativePricing,
+      calls: [] as PlanCall[],
+      executable: false,
+      userApprovalRequired: false,
+    };
+    const planId = await persistPlan({ userId: input.userId, strategyId: strategy.id, version: version.version, status: "draft", plan, checks });
+    return { planId, ...plan, checks };
+  }
+
+  const allowanceTargets = priceWork.map(work => work.allowanceTarget);
+  if (allowanceTargets.some(target => !target)) {
+    throw new ExecutionPreparationError("invalid_0x_allowance_target", "0x did not return a valid AllowanceHolder target", 502);
+  }
+  const normalizedTargets = new Set((allowanceTargets as string[]).map(target => target.toLowerCase()));
+  if (normalizedTargets.size !== 1) throw new ExecutionPreparationError("allowance_target_mismatch", "0x returned inconsistent allowance targets", 409);
+  const allowanceTarget = allowanceTargets[0] as string;
+  const allowance = await readAllowance(USDC, input.smartAccountAddress, allowanceTarget);
 
   if (allowance < totalSell) {
     const calls: PlanCall[] = [{
@@ -148,15 +205,18 @@ export async function prepareExecution(input: { userId: string; smartAccountAddr
     const checks: PlanCheck[] = [
       { name: "asset_registry", passed: true },
       ...b20Checks,
-      { name: "usdc_balance", passed: true },
-      { name: "exact_allowance", passed: true, detail: `${formatUnits(totalSell, USDC_DECIMALS)} USDC; no unlimited approval` },
+      { name: "usdc_balance", passed: true, detail: `${formatUnits(balance, USDC_DECIMALS)} USDC covers full ${formatUnits(requiredCapital, USDC_DECIMALS)} USDC portfolio capital` },
+      { name: "exact_allowance", passed: true, detail: `${formatUnits(totalSell, USDC_DECIMALS)} USDC stock spend; no unlimited approval` },
     ];
     const plan = {
       phase: "allowance_required",
       strategyVersionId: version.id,
       allowanceTarget,
+      requiredCapital: requiredCapital.toString(),
       requiredAllowance: totalSell.toString(),
       currentAllowance: allowance.toString(),
+      pricingType: "indicative_0x_price",
+      pricing: indicativePricing,
       calls,
       executable: true,
     };
@@ -172,7 +232,7 @@ export async function prepareExecution(input: { userId: string; smartAccountAddr
   const checks: PlanCheck[] = [
     { name: "asset_registry", passed: true },
     ...b20Checks,
-    { name: "usdc_balance", passed: true },
+    { name: "usdc_balance", passed: true, detail: `${formatUnits(balance, USDC_DECIMALS)} USDC covers full ${formatUnits(requiredCapital, USDC_DECIMALS)} USDC portfolio capital` },
     { name: "usdc_allowance", passed: true, detail: `AllowanceHolder has at least ${formatUnits(totalSell, USDC_DECIMALS)} USDC allowance` },
   ];
   const quoteSummaries: Array<Record<string, unknown>> = [];
@@ -205,8 +265,10 @@ export async function prepareExecution(input: { userId: string; smartAccountAddr
     phase: executable ? "ready" : "blocked",
     strategyVersionId: version.id,
     allowanceTarget,
+    requiredCapital: requiredCapital.toString(),
     calls,
     quotes: quoteSummaries,
+    pricingType: "firm_0x_quote",
     expiresAt,
     executable,
     userApprovalRequired: true,
