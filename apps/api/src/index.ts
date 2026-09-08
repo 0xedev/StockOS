@@ -3,19 +3,22 @@ import cors from "@fastify/cors";
 import { formatEther, formatUnits, parseEther, parseUnits } from "viem";
 import { OpenRouterRequestError } from "../../../packages/ai/src/openrouter.ts";
 import { parseIntentWithOpenRouterCompatible } from "../../../packages/ai/src/openrouter-compatible.ts";
+import { parseIntentWithProvider, type ByokProvider } from "../../../packages/ai/src/providers.ts";
 import { deterministicIntentV3 } from "../../../packages/ai/src/deterministic-v3.ts";
 import { ASSETS } from "../../../packages/b20/src/registry.ts";
 import { compileStrategy } from "../../../packages/strategy/src/compiler.ts";
 import { evaluatePolicy } from "../../../packages/policy/src/engine.ts";
-import { getAiSettings, resolveAiRuntime, revokeOpenRouterByok, saveOpenRouterByok } from "./lib/ai-runtime.ts";
+import { getAiSettings, resolveAiRuntime, saveByok, switchToManagedAi } from "./lib/ai-runtime.ts";
 import { assertEvmAddress, encodeTokenTransfer, readNativeBalance, readTokenBalance } from "./lib/chain.ts";
 import { ExecutionPreparationError, markPlanSubmitted, prepareExecution } from "./lib/execution.ts";
 import { createOnrampBuyQuote, getOnrampBuyOptions, OnrampRequestError } from "./lib/onramp.ts";
+import { getPortfolioState } from "./lib/portfolio.ts";
 import { requireStockOsSession } from "./lib/session.ts";
 import { persistStrategyDraft } from "./lib/strategy-store.ts";
 
 const app = Fastify({ logger: true });
 const allowedOrigins = new Set((process.env.CORS_ORIGINS ?? "http://localhost:3000").split(",").map(value => value.trim()).filter(Boolean));
+const supportedByokProviders = new Set<ByokProvider>(["openai", "anthropic", "gemini", "openrouter"]);
 await app.register(cors, {
   origin(origin, callback) {
     if (!origin || allowedOrigins.has(origin)) return callback(null, true);
@@ -31,6 +34,12 @@ app.post("/v1/session", async (request, reply) => {
   const session = await requireStockOsSession(request, reply);
   if (!session) return;
   return session;
+});
+
+app.get("/v1/portfolio/active", async (request, reply) => {
+  const session = await requireStockOsSession(request, reply);
+  if (!session) return;
+  return getPortfolioState(session.profile.id);
 });
 
 app.get("/v1/wallet/summary", async (request, reply) => {
@@ -119,19 +128,37 @@ app.get("/v1/ai/settings", async (request, reply) => {
   return getAiSettings(session.profile.id);
 });
 
+app.post("/v1/ai/byok", async (request, reply) => {
+  const session = await requireStockOsSession(request, reply);
+  if (!session) return;
+  const body = (request.body ?? {}) as { provider?: string; apiKey?: string; model?: string };
+  if (!body.apiKey) return reply.code(400).send({ error: "api_key_required", message: "API key is required" });
+  if (!body.provider || !supportedByokProviders.has(body.provider as ByokProvider)) {
+    return reply.code(400).send({ error: "unsupported_ai_provider", message: "Choose OpenAI, Anthropic, Gemini, or OpenRouter." });
+  }
+  try { return await saveByok(session.profile.id, body.provider as ByokProvider, body.apiKey, body.model); }
+  catch (error) { return reply.code(400).send({ error: "byok_verification_failed", message: error instanceof Error ? error.message : "Could not verify BYOK key" }); }
+});
+
+app.delete("/v1/ai/byok", async (request, reply) => {
+  const session = await requireStockOsSession(request, reply);
+  if (!session) return;
+  return switchToManagedAi(session.profile.id);
+});
+
+// Legacy endpoint kept temporarily so older deployed clients can switch without breaking.
 app.post("/v1/ai/byok/openrouter", async (request, reply) => {
   const session = await requireStockOsSession(request, reply);
   if (!session) return;
   const body = (request.body ?? {}) as { apiKey?: string; model?: string };
   if (!body.apiKey) return reply.code(400).send({ error: "api_key_required" });
-  try { return await saveOpenRouterByok(session.profile.id, body.apiKey, body.model); }
+  try { return await saveByok(session.profile.id, "openrouter", body.apiKey, body.model); }
   catch (error) { return reply.code(400).send({ error: "byok_verification_failed", message: error instanceof Error ? error.message : "Could not verify BYOK key" }); }
 });
-
 app.delete("/v1/ai/byok/openrouter", async (request, reply) => {
   const session = await requireStockOsSession(request, reply);
   if (!session) return;
-  return revokeOpenRouterByok(session.profile.id);
+  return switchToManagedAi(session.profile.id);
 });
 
 app.get("/v1/onramp/buy-options", async (request, reply) => {
@@ -170,7 +197,9 @@ app.post("/v1/strategy/compile", async (request, reply) => {
   let fallbackReason: string | null = null;
   try {
     if (runtime.apiKey) {
-      const parsed = await parseIntentWithOpenRouterCompatible(prompt, runtime.apiKey, runtime.model);
+      const parsed = runtime.source === "managed"
+        ? await parseIntentWithOpenRouterCompatible(prompt, runtime.apiKey, runtime.model)
+        : await parseIntentWithProvider({ provider: runtime.provider as ByokProvider, prompt, apiKey: runtime.apiKey, model: runtime.model });
       intent = parsed.intent;
       effectiveModel = parsed.model;
     } else {
@@ -193,8 +222,8 @@ app.post("/v1/strategy/compile", async (request, reply) => {
       const statusCode = error.status === 429 ? 429 : error.status === 504 ? 504 : 503;
       return reply.code(statusCode).send({
         error: error.status === 429 ? "ai_capacity_limited" : error.status === 504 ? "ai_timeout" : "ai_provider_unavailable",
-        message: error.status === 429 ? "Your selected OpenRouter model is currently rate-limited or at capacity." : error.status === 504 ? "Your selected OpenRouter model did not respond before StockOS's timeout." : "The selected AI provider could not produce a valid strategy.",
-        provider: "openrouter",
+        message: error.status === 429 ? "Your selected AI model is currently rate-limited or at capacity." : error.status === 504 ? "Your selected AI model did not respond before StockOS's timeout." : "The selected AI provider could not produce a valid strategy.",
+        provider: runtime.provider,
         requestedModel: runtime.model,
       });
     } else { throw error; }

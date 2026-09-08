@@ -8,8 +8,10 @@
     "start": "tsx src/index.ts"
   },
   "dependencies": {
+    "@supabase/supabase-js": "latest",
     "bullmq": "latest",
-    "ioredis": "latest"
+    "ioredis": "latest",
+    "viem": "latest"
   },
   "devDependencies": {
     "tsx": "latest",
