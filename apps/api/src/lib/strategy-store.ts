@@ -6,6 +6,15 @@ function sha256(value: string) {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function nextRebalanceAt(rebalance: InvestmentIntent["automation"]["rebalance"]): string | null {
+  if (rebalance === "NONE") return null;
+  const next = new Date();
+  if (rebalance === "WEEKLY") next.setUTCDate(next.getUTCDate() + 7);
+  if (rebalance === "MONTHLY") next.setUTCMonth(next.getUTCMonth() + 1);
+  if (rebalance === "QUARTERLY") next.setUTCMonth(next.getUTCMonth() + 3);
+  return next.toISOString();
+}
+
 export async function persistStrategyDraft(input: {
   userId: string;
   prompt: string;
@@ -58,6 +67,22 @@ export async function persistStrategyDraft(input: {
   if (constraints.length) {
     const { error } = await db.from("strategy_constraints").insert(constraints);
     if (error) throw new Error(`Could not persist strategy constraints: ${error.message}`);
+  }
+
+  const nextRunAt = nextRebalanceAt(input.intent.automation.rebalance);
+  if (nextRunAt) {
+    const { error } = await db.from("automation_rules").insert({
+      strategy_id: strategyRow.id,
+      rule_type: "scheduled_rebalance",
+      parameters: {
+        frequency: input.intent.automation.rebalance,
+        mode: "user_approval_required",
+        source: "strategy_intent",
+      },
+      enabled: true,
+      next_run_at: nextRunAt,
+    });
+    if (error) throw new Error(`Could not persist rebalance rule: ${error.message}`);
   }
 
   await db.from("agent_decisions").insert({
