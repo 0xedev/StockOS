@@ -11,6 +11,7 @@ import { getAiSettings, resolveAiRuntime, revokeOpenRouterByok, saveOpenRouterBy
 import { assertEvmAddress, encodeTokenTransfer, readNativeBalance, readTokenBalance } from "./lib/chain.ts";
 import { ExecutionPreparationError, markPlanSubmitted, prepareExecution } from "./lib/execution.ts";
 import { createOnrampBuyQuote, getOnrampBuyOptions, OnrampRequestError } from "./lib/onramp.ts";
+import { getPortfolioState } from "./lib/portfolio.ts";
 import { requireStockOsSession } from "./lib/session.ts";
 import { persistStrategyDraft } from "./lib/strategy-store.ts";
 
@@ -31,6 +32,12 @@ app.post("/v1/session", async (request, reply) => {
   const session = await requireStockOsSession(request, reply);
   if (!session) return;
   return session;
+});
+
+app.get("/v1/portfolio/active", async (request, reply) => {
+  const session = await requireStockOsSession(request, reply);
+  if (!session) return;
+  return getPortfolioState(session.profile.id);
 });
 
 app.get("/v1/wallet/summary", async (request, reply) => {
@@ -193,8 +200,7 @@ app.post("/v1/strategy/compile", async (request, reply) => {
       const statusCode = error.status === 429 ? 429 : error.status === 504 ? 504 : 503;
       return reply.code(statusCode).send({
         error: error.status === 429 ? "ai_capacity_limited" : error.status === 504 ? "ai_timeout" : "ai_provider_unavailable",
-        message: error.status === 429 ? "Your selected OpenRouter model is currently rate-limited or at capacity." : error.status === 504 ? "Your selected OpenRouter model did not respond before StockOS's timeout." : "The selected AI provider could not produce a valid strategy.",
-        provider: "openrouter",
+        message: error.status === 429 ? "Your selected AI model is currently rate-limited or at capacity." : error.status === 504 ? "Your selected AI model did not respond before StockOS's timeout." : "The selected AI provider could not produce a valid strategy.",
         requestedModel: runtime.model,
       });
     } else { throw error; }
