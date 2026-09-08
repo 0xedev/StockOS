@@ -26,9 +26,22 @@ const providerModels: Record<ByokProvider, string> = {
 
 type ExecutionPlan = {
   planId: string;
-  phase: "allowance_required" | "ready" | "blocked";
+  phase: "funding_required" | "allowance_required" | "ready" | "blocked";
   executable: boolean;
   expiresAt?: string;
+  requiredCapital?: string;
+  requiredStockSpend?: string;
+  currentBalance?: string;
+  fundingShortfall?: string;
+  pricingType?: "indicative_0x_price" | "firm_0x_quote";
+  pricing?: Array<{
+    asset: string;
+    sellUsd: number;
+    buyAmount?: string;
+    tokenDecimals?: number;
+    buyQuantity?: number | null;
+    routeAvailable?: boolean;
+  }>;
   calls: Array<{ kind: "approval" | "swap"; label: string; to: string; data: string; value: string }>;
   checks: Array<{ name: string; passed: boolean; detail?: string }>;
 };
@@ -267,6 +280,21 @@ export default function Home() {
     finally { setLoading(false); }
   }
 
+  async function prepareStrategyVersion(strategyVersionId: string) {
+    setLoading(true); setMessage(""); setExecutionPlan(null);
+    try {
+      const response = await authenticatedFetch("/v1/execution/prepare", { method: "POST", body: JSON.stringify({ strategyVersionId }) });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.message ?? body.error ?? "Could not prepare execution");
+      setExecutionPlan(body);
+      await refreshWallet().catch(() => undefined);
+      return body as ExecutionPlan;
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not prepare execution");
+      return null;
+    } finally { setLoading(false); }
+  }
+
   async function compile() {
     if (!prompt.trim()) return setMessage("Describe the portfolio you want first.");
     setCompiling(true); setMessage(""); setExecutionPlan(null);
@@ -275,30 +303,20 @@ export default function Home() {
       const body = await response.json();
       if (!response.ok) throw new Error(body.message ?? body.error ?? "Strategy compilation failed");
       setResult(body);
+      if (body.policy?.allowed && body.draft?.strategyVersionId) {
+        await prepareStrategyVersion(body.draft.strategyVersionId);
+      }
     } catch (error) { setMessage(error instanceof Error ? error.message : "Strategy compilation failed"); }
     finally { setCompiling(false); }
   }
 
   async function prepare() {
     if (!result?.draft?.strategyVersionId) return;
-    setLoading(true); setMessage(""); setExecutionPlan(null);
-    try {
-      const response = await authenticatedFetch("/v1/execution/prepare", { method: "POST", body: JSON.stringify({ strategyVersionId: result.draft.strategyVersionId }) });
-      const body = await response.json();
-      if (!response.ok) {
-        if (body.error === "insufficient_usdc") {
-          setWalletOpen(true);
-          await refreshWallet().catch(() => undefined);
-        }
-        throw new Error(body.message ?? body.error ?? "Could not prepare execution");
-      }
-      setExecutionPlan(body);
-    } catch (error) { setMessage(error instanceof Error ? error.message : "Could not prepare execution"); }
-    finally { setLoading(false); }
+    await prepareStrategyVersion(result.draft.strategyVersionId);
   }
 
   async function executePlan() {
-    if (!executionPlan?.executable || !cdpSmartAccount || executionPlan.phase === "blocked") return;
+    if (!executionPlan?.executable || !cdpSmartAccount || executionPlan.phase === "blocked" || executionPlan.phase === "funding_required") return;
     if (executionPlan.expiresAt && Date.now() > Date.parse(executionPlan.expiresAt)) {
       setMessage("The quote expired. Prepare a fresh execution plan."); setExecutionPlan(null); return;
     }
@@ -400,8 +418,12 @@ export default function Home() {
   const availableUsdc = Number(walletSummary?.balances.USDC.formatted ?? 0);
   const usdcBalance = availableUsdc.toLocaleString(undefined, { maximumFractionDigits: 6 });
   const ethBalance = Number(walletSummary?.balances.ETH.formatted ?? 0).toLocaleString(undefined, { maximumFractionDigits: 6 });
-  const requiredUsdc = Number(result?.strategy?.allocations?.filter((allocation: any) => allocation.asset !== "USDC").reduce((sum: number, allocation: any) => sum + Number(allocation.amountUsd ?? 0), 0) ?? 0);
+  const requiredUsdc = Number(result?.strategy?.totalUsd ?? 0);
+  const stockTradeUsd = Number(result?.strategy?.allocations?.filter((allocation: any) => allocation.asset !== "USDC").reduce((sum: number, allocation: any) => sum + Number(allocation.amountUsd ?? 0), 0) ?? 0);
+  const cashTargetUsd = Number(result?.strategy?.allocations?.find((allocation: any) => allocation.asset === "USDC")?.amountUsd ?? 0);
   const fundingShortfall = Math.max(0, requiredUsdc - availableUsdc);
+  const needsFunding = fundingShortfall > 0;
+  const hasLivePricing = !!executionPlan?.pricing?.length;
   const executionStatus = portfolioState?.execution?.status;
   const executionPending = executionStatus === "submitted" || executionStatus === "confirming";
   const executionFailed = executionStatus === "failed";
@@ -418,14 +440,14 @@ export default function Home() {
 
     <section className="hero">
       <div><p className="eyebrow">PROGRAMMABLE INVESTING</p><h1>Tell your portfolio<br/>what you want.</h1><p className="lede">Type the allocation, constraints, risk profile or plain-English goal. StockOS turns it into a validated portfolio using tokenized stocks on Base.</p>{isSignedIn && <div className="identity"><span>Smart account</span><code>{smartAddress ?? "Creating…"}</code></div>}</div>
-      <div className="composer"><label>Describe your strategy</label><textarea value={prompt} onChange={event => setPrompt(event.target.value)} placeholder="e.g. Invest $1,000: 50% Apple, 30% Nvidia and 20% cash."/><div className="examples">{examples.map(example => <button type="button" key={example} onClick={() => setPrompt(example)}>{example}</button>)}</div><button className="primary" onClick={compile} disabled={operationPending || !isSignedIn || !prompt.trim()}>{!isSignedIn ? "Sign in to build" : compiling ? "Compiling your strategy…" : "Build my strategy"}</button><small>Managed AI proposes weights. StockOS validates the result deterministically. You approve every execution.</small></div>
+      <div className="composer"><label>Describe your strategy</label><textarea value={prompt} onChange={event => setPrompt(event.target.value)} placeholder="e.g. Invest $1,000: 50% Apple, 30% Nvidia and 20% cash."/><div className="examples">{examples.map(example => <button type="button" key={example} onClick={() => setPrompt(example)}>{example}</button>)}</div><button className="primary" onClick={compile} disabled={operationPending || !isSignedIn || !prompt.trim()}>{!isSignedIn ? "Sign in to build" : compiling ? "Building strategy & checking 0x…" : "Build my strategy"}</button><small>Managed AI proposes weights. StockOS validates the result deterministically, then checks live 0x pricing before asking you to fund.</small></div>
     </section>
 
     {message && <p className="message">{message}</p>}
 
-    {result && <section className="result"><header><div><span>Strategy preview</span><h2>${result.strategy?.totalUsd?.toLocaleString()}</h2><small>{result.ai?.source === "managed" ? "Managed AI" : result.ai?.source === "byok" ? "Your AI provider" : result.ai?.source === "deterministic_fallback" ? "Deterministic fallback" : "StockOS parser"}</small></div><span className={result.policy?.allowed ? "pill ok" : "pill"}>{result.policy?.allowed ? "Policy passed" : "Review required"}</span></header><div className="grid">{result.strategy?.allocations?.map((allocation: any) => <article key={allocation.asset}><strong>{allocation.asset}</strong><b>{(allocation.weight * 100).toFixed((allocation.weight * 100) % 1 ? 1 : 0)}%</b><span>${allocation.amountUsd}</span></article>)}</div>{result.strategy?.warnings?.length > 0 && <div className="warnings">{result.strategy.warnings.map((warning: string) => <p key={warning}>{warning}</p>)}</div>}<div className="checks">{result.policy?.checks?.map((check: any) => <span key={check.name} className={check.passed ? "pass" : "fail"}>{check.passed ? "✓" : "×"} {check.name}</span>)}</div><div className="next-step"><div><strong>{requiredUsdc <= 0 ? "No stock trade is required" : fundingShortfall > 0 ? `${formatUsd(fundingShortfall)} more USDC needed` : "Ready for execution review"}</strong><span>{requiredUsdc <= 0 ? "This strategy is entirely cash." : fundingShortfall > 0 ? `Your Smart Account has ${formatUsd(availableUsdc)}. Fund it, then StockOS will build live 0x quotes.` : "StockOS will now check live balances, B20 policy, liquidity, allowance and reference pricing."}</span></div><button className="execution-cta" onClick={() => fundingShortfall > 0 ? setWalletOpen(true) : void prepare()} disabled={operationPending || !result.policy?.allowed || requiredUsdc <= 0}>{requiredUsdc <= 0 ? "No trade required" : fundingShortfall > 0 ? "Fund wallet to continue" : loading ? "Preparing execution…" : "Review & invest"}</button></div></section>}
+    {result && <section className="result"><header><div><span>Strategy preview</span><h2>${result.strategy?.totalUsd?.toLocaleString()}</h2><small>{result.ai?.source === "managed" ? "Managed AI" : result.ai?.source === "byok" ? "Your AI provider" : result.ai?.source === "deterministic_fallback" ? "Deterministic fallback" : "StockOS parser"}</small></div><span className={result.policy?.allowed ? "pill ok" : "pill"}>{result.policy?.allowed ? "Policy passed" : "Review required"}</span></header><div className="grid">{result.strategy?.allocations?.map((allocation: any) => <article key={allocation.asset}><strong>{allocation.asset}</strong><b>{(allocation.weight * 100).toFixed((allocation.weight * 100) % 1 ? 1 : 0)}%</b><span>${allocation.amountUsd}</span></article>)}</div>{result.strategy?.warnings?.length > 0 && <div className="warnings">{result.strategy.warnings.map((warning: string) => <p key={warning}>{warning}</p>)}</div>}<div className="checks">{result.policy?.checks?.map((check: any) => <span key={check.name} className={check.passed ? "pass" : "fail"}>{check.passed ? "✓" : "×"} {check.name}</span>)}</div><div className="next-step"><div><strong>{stockTradeUsd <= 0 ? "No stock trade is required" : executionPlan?.phase === "funding_required" && needsFunding ? `${formatUsd(fundingShortfall)} more USDC needed` : hasLivePricing ? "Live 0x pricing checked" : loading || compiling ? "Checking live 0x pricing…" : "Build live 0x pricing"}</strong><span>{stockTradeUsd <= 0 ? "This strategy is entirely cash." : executionPlan?.phase === "funding_required" && needsFunding ? `0x pricing is already checked. Your Smart Account has ${formatUsd(availableUsdc)}. Fund the full ${formatUsd(requiredUsdc)} portfolio capital; ${formatUsd(cashTargetUsd)} stays as USDC cash and ${formatUsd(stockTradeUsd)} is used for stock purchases.` : hasLivePricing ? "StockOS found live 0x pricing for the stock legs. Funding, allowance and firm execution checks are evaluated separately." : "StockOS checks live 0x routes before it asks you to deposit anything."}</span></div><button className="execution-cta" onClick={() => needsFunding && executionPlan?.phase === "funding_required" ? setWalletOpen(true) : void prepare()} disabled={operationPending || !result.policy?.allowed || stockTradeUsd <= 0}>{stockTradeUsd <= 0 ? "No trade required" : needsFunding && executionPlan?.phase === "funding_required" ? `Fund ${formatUsd(fundingShortfall)}` : hasLivePricing ? "Refresh live pricing" : "Build live 0x pricing"}</button></div></section>}
 
-    {executionPlan && <section className="execution"><header><div><p className="eyebrow">EXECUTION PLAN</p><h2>{executionPlan.phase === "allowance_required" ? "Step 1 · Exact allowance" : executionPlan.phase === "ready" ? "Step 2 · Ready to invest" : "Execution blocked"}</h2></div><span className={executionPlan.executable ? "pill ok" : "pill"}>{executionPlan.executable ? "Checks passed" : "Fail closed"}</span></header><div className="call-list">{executionPlan.calls.map((call,index) => <div key={`${call.kind}-${index}`}><b>{index+1}. {call.label}</b><code>{call.to}</code></div>)}</div><div className="checks">{executionPlan.checks.map(check => <span key={check.name} className={check.passed ? "pass" : "fail"}>{check.passed ? "✓" : "×"} {check.name}{check.detail ? ` · ${check.detail}` : ""}</span>)}</div>{executionPlan.expiresAt && <p className="note">Firm 0x quote expires at {new Date(executionPlan.expiresAt).toLocaleTimeString()}.</p>}<button className="execute-button" onClick={executePlan} disabled={operationPending || !executionPlan.executable}>{executionPlan.phase === "allowance_required" ? "Approve exact USDC allowance" : "Confirm & invest"}</button><p className="note">Your CDP Smart Account submits this operation only after you approve it. The AI never signs transactions.</p></section>}
+    {executionPlan && <section className="execution"><header><div><p className="eyebrow">EXECUTION PLAN</p><h2>{executionPlan.phase === "funding_required" ? "Live 0x pricing · Funding required" : executionPlan.phase === "allowance_required" ? "Step 1 · Exact allowance" : executionPlan.phase === "ready" ? "Step 2 · Ready to invest" : "Execution blocked"}</h2></div><span className={executionPlan.phase === "funding_required" ? "pill ok" : executionPlan.executable ? "pill ok" : "pill"}>{executionPlan.phase === "funding_required" ? "0x pricing ready" : executionPlan.executable ? "Checks passed" : "Fail closed"}</span></header>{executionPlan.phase === "funding_required" ? <div className="call-list">{executionPlan.pricing?.map(price => <div key={price.asset}><b>{price.asset} · {formatUsd(price.sellUsd)}</b><span>{price.buyQuantity != null ? `≈ ${price.buyQuantity.toLocaleString(undefined, { maximumFractionDigits: 6 })} ${price.asset}` : "Live route available"}</span></div>)}</div> : <div className="call-list">{executionPlan.calls.map((call,index) => <div key={`${call.kind}-${index}`}><b>{index+1}. {call.label}</b><code>{call.to}</code></div>)}</div>}<div className="checks">{executionPlan.checks.map(check => <span key={check.name} className={check.passed ? "pass" : "fail"}>{check.passed ? "✓" : "×"} {check.name}{check.detail ? ` · ${check.detail}` : ""}</span>)}</div>{executionPlan.expiresAt && <p className="note">Firm 0x quote expires at {new Date(executionPlan.expiresAt).toLocaleTimeString()}.</p>}{executionPlan.phase === "funding_required" ? <><button className="execute-button" onClick={() => needsFunding ? setWalletOpen(true) : void prepare()} disabled={operationPending}>{needsFunding ? `Fund ${formatUsd(fundingShortfall)} USDC` : "Funding detected · Recheck now"}</button><p className="note">These are live indicative 0x prices, so you can inspect routes before funding. StockOS fetches fresh firm quotes only after the full portfolio capital and exact allowance are available.</p></> : <><button className="execute-button" onClick={executePlan} disabled={operationPending || !executionPlan.executable}>{executionPlan.phase === "allowance_required" ? "Approve exact USDC allowance" : "Confirm & invest"}</button><p className="note">Your CDP Smart Account submits this operation only after you approve it. The AI never signs transactions.</p></>}</section>}
 
     {pendingExecution && <section className="lifecycle-card pending"><div><p className="eyebrow">COINBASE USER OPERATION</p><h2>Waiting for the Base transaction.</h2><p>Coinbase is tracking the signed Smart Account operation. As soon as it produces the transaction hash, StockOS will persist it and the Railway worker takes over monitoring.</p></div><div className="lifecycle-side"><span className="status-dot">{pendingExecution.handingOff ? "Handoff" : sendStatus === "success" ? "Finalizing" : "Pending"}</span><code>{pendingExecution.userOperationHash.slice(0, 12)}…</code></div></section>}
 
@@ -440,7 +462,7 @@ export default function Home() {
     {isSignedIn && walletOpen && <div className="wallet-modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) setWalletOpen(false); }}>
       <section className="wallet-modal" role="dialog" aria-modal="true" aria-labelledby="wallet-modal-title">
         <header className="wallet-modal-header"><div><p className="eyebrow">YOUR BASE WALLET</p><h2 id="wallet-modal-title">Wallet</h2></div><button type="button" className="wallet-modal-close" aria-label="Close wallet" onClick={() => setWalletOpen(false)}>×</button></header>
-        <div className="wallet-panel wallet-panel-modal"><div><h2>Your assets</h2><p>The Smart Account holds and trades your assets. Its owner EOA is the exportable key that controls it.</p><div className="balance-grid"><div><span>USDC</span><strong>{usdcBalance}</strong></div><div><span>ETH</span><strong>{ethBalance}</strong></div></div><div className="wallet-address"><span>Smart Account</span><code>{smartAddress ?? "Creating…"}</code></div>{ownerAddress && <div className="wallet-address"><span>Owner EOA</span><code>{ownerAddress}</code></div>}<div className="buttons wallet-top-actions"><button onClick={copyReceiveAddress} disabled={!smartAddress}>Receive / copy address</button><button className="secondary-action" onClick={() => refreshWallet().catch(error => setMessage(error.message))} disabled={operationPending}>Refresh balances</button>{smartAddress && <a className="button-link" href={`https://basescan.org/address/${smartAddress}`} target="_blank" rel="noreferrer">BaseScan</a>}</div></div><div className="wallet-actions"><div className="wallet-box"><strong>Fund wallet</strong><p>Buy USDC into this Smart Account with Coinbase Onramp, where available.</p><div className="fund-config"><label>Country code<input value={fundCountry} maxLength={2} onChange={event => setFundCountry(event.target.value.toUpperCase())} placeholder="NG"/></label>{fundCountry === "US" && <label>State code<input value={fundSubdivision} maxLength={3} onChange={event => setFundSubdivision(event.target.value.toUpperCase())} placeholder="NY"/></label>}</div><div className="buttons">{countryReady && smartAddress ? <FundModal country={fundCountry} subdivision={fundSubdivision || undefined} cryptoCurrency="usdc" fiatCurrency="usd" fetchBuyQuote={fetchBuyQuote} fetchBuyOptions={fetchBuyOptions} network="base" destinationAddress={smartAddress} presetAmountInputs={[25,50,100]} title="Fund your StockOS wallet" onSuccess={() => { setMessage("Funding completed. Refreshing wallet balance."); refreshWallet().catch(() => undefined); }} onError={() => setMessage("Coinbase funding is unavailable for this country, account, or payment method.")} /> : <button disabled>{!smartAddress ? "Smart Account is still being created" : "Enter country code to fund"}</button>}{ownerAddress && <ExportWalletModal address={ownerAddress} onCopySuccess={() => setMessage("Owner private key copied through Coinbase's secure export flow. StockOS never receives it.")} onIframeError={error => setMessage(error ?? "Wallet export failed")}><button type="button" className="secondary-action">Export owner key</button></ExportWalletModal>}</div><small>You can always fund directly by sending Base USDC or ETH to the Smart Account address.</small></div><div className="wallet-box"><strong>Send / withdraw</strong><p>Prepare a deterministic transfer, then approve it with your CDP Smart Account.</p><div className="send-row"><select value={sendAsset} onChange={event => setSendAsset(event.target.value as "USDC" | "ETH")}><option value="USDC">USDC</option><option value="ETH">ETH</option></select><input value={sendAmount} onChange={event => setSendAmount(event.target.value)} inputMode="decimal" placeholder="Amount"/></div><input value={sendTo} onChange={event => setSendTo(event.target.value)} placeholder="0x recipient address"/><button onClick={sendWalletAsset} disabled={operationPending || !sendAmount.trim() || !sendTo.trim()}>Review & send {sendAsset}</button><small>The AI cannot call this action. The backend only prepares transfer calldata after you enter the destination and amount.</small></div></div></div>
+        <div className="wallet-panel wallet-panel-modal"><div><h2>Your assets</h2><p>The Smart Account holds and trades your assets. Its owner EOA is the exportable key that controls it.</p><div className="balance-grid"><div><span>USDC</span><strong>{usdcBalance}</strong></div><div><span>ETH</span><strong>{ethBalance}</strong></div></div><div className="wallet-address"><span>Smart Account</span><code>{smartAddress ?? "Creating…"}</code></div>{ownerAddress && <div className="wallet-address"><span>Owner EOA</span><code>{ownerAddress}</code></div>}<div className="buttons wallet-top-actions"><button onClick={copyReceiveAddress} disabled={!smartAddress}>Receive / copy address</button><button className="secondary-action" onClick={() => refreshWallet().catch(error => setMessage(error.message))} disabled={operationPending}>Refresh balances</button>{smartAddress && <a className="button-link" href={`https://basescan.org/address/${smartAddress}`} target="_blank" rel="noreferrer">BaseScan</a>}</div></div><div className="wallet-actions"><div className="wallet-box"><strong>Fund wallet</strong><p>Buy USDC into this Smart Account with Coinbase Onramp, where available.</p><div className="fund-config"><label>Country code<input value={fundCountry} maxLength={2} onChange={event => setFundCountry(event.target.value.toUpperCase())} placeholder="NG"/></label>{fundCountry === "US" && <label>State code<input value={fundSubdivision} maxLength={3} onChange={event => setFundSubdivision(event.target.value.toUpperCase())} placeholder="NY"/></label>}</div><div className="buttons">{countryReady && smartAddress ? <FundModal country={fundCountry} subdivision={fundSubdivision || undefined} cryptoCurrency="usdc" fiatCurrency="usd" fetchBuyQuote={fetchBuyQuote} fetchBuyOptions={fetchBuyOptions} network="base" destinationAddress={smartAddress} presetAmountInputs={[25,50,100]} title="Fund your StockOS wallet" onSuccess={() => { setMessage("Funding completed. Refreshing balance and rebuilding fresh 0x pricing."); void (async () => { await refreshWallet().catch(() => undefined); await prepare(); })(); }} onError={() => setMessage("Coinbase funding is unavailable for this country, account, or payment method.")} /> : <button disabled>{!smartAddress ? "Smart Account is still being created" : "Enter country code to fund"}</button>}{ownerAddress && <ExportWalletModal address={ownerAddress} onCopySuccess={() => setMessage("Owner private key copied through Coinbase's secure export flow. StockOS never receives it.")} onIframeError={error => setMessage(error ?? "Wallet export failed")}><button type="button" className="secondary-action">Export owner key</button></ExportWalletModal>}</div><small>You can always fund directly by sending Base USDC or ETH to the Smart Account address.</small></div><div className="wallet-box"><strong>Send / withdraw</strong><p>Prepare a deterministic transfer, then approve it with your CDP Smart Account.</p><div className="send-row"><select value={sendAsset} onChange={event => setSendAsset(event.target.value as "USDC" | "ETH")}><option value="USDC">USDC</option><option value="ETH">ETH</option></select><input value={sendAmount} onChange={event => setSendAmount(event.target.value)} inputMode="decimal" placeholder="Amount"/></div><input value={sendTo} onChange={event => setSendTo(event.target.value)} placeholder="0x recipient address"/><button onClick={sendWalletAsset} disabled={operationPending || !sendAmount.trim() || !sendTo.trim()}>Review & send {sendAsset}</button><small>The AI cannot call this action. The backend only prepares transfer calldata after you enter the destination and amount.</small></div></div></div>
         <footer className="wallet-modal-footer"><div><strong>Account</strong><span>Signed in with Coinbase CDP</span></div><AuthButton /></footer>
       </section>
     </div>}
