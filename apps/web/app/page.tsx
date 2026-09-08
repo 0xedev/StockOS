@@ -37,6 +37,7 @@ type PendingExecutionSubmission = {
   planId: string;
   phase: "allowance_required" | "ready";
   userOperationHash: string;
+  handingOff?: boolean;
 };
 
 type WalletSummary = {
@@ -325,7 +326,7 @@ export default function Home() {
   }
 
   useEffect(() => {
-    if (!pendingExecution) return;
+    if (!pendingExecution || pendingExecution.handingOff) return;
     if (sendStatus === "error") {
       setMessage(sendError?.message ?? "Coinbase could not complete the user operation.");
       setPendingExecution(null);
@@ -340,9 +341,8 @@ export default function Home() {
     const transactionHash = data.transactionHash;
     if (!transactionHash) return;
 
-    let cancelled = false;
     const submission = pendingExecution;
-    setPendingExecution(null);
+    setPendingExecution({ ...submission, handingOff: true });
     void (async () => {
       try {
         const submittedResponse = await authenticatedFetch(`/v1/execution/${submission.planId}/submitted`, {
@@ -351,7 +351,6 @@ export default function Home() {
         });
         const submittedBody = await submittedResponse.json();
         if (!submittedResponse.ok) throw new Error(submittedBody.message ?? submittedBody.error ?? "Could not record submitted transaction");
-        if (cancelled) return;
 
         if (submission.phase === "allowance_required") {
           setMessage("Exact USDC allowance confirmed. StockOS is rebuilding fresh 0x quotes before the trade.");
@@ -361,12 +360,12 @@ export default function Home() {
           await Promise.all([refreshPortfolio().catch(() => undefined), refreshWallet().catch(() => undefined)]);
         }
       } catch (error) {
-        if (!cancelled) setMessage(error instanceof Error ? error.message : "Could not hand the transaction to StockOS monitoring");
+        setMessage(error instanceof Error ? error.message : "Could not hand the transaction to StockOS monitoring");
       } finally {
-        if (!cancelled) setLoading(false);
+        setPendingExecution(current => current?.planId === submission.planId ? null : current);
+        setLoading(false);
       }
     })();
-    return () => { cancelled = true; };
   }, [authenticatedFetch, pendingExecution, refreshPortfolio, refreshWallet, sendData, sendError, sendStatus]);
 
   async function saveByok() {
@@ -428,7 +427,7 @@ export default function Home() {
 
     {executionPlan && <section className="execution"><header><div><p className="eyebrow">EXECUTION PLAN</p><h2>{executionPlan.phase === "allowance_required" ? "Step 1 · Exact allowance" : executionPlan.phase === "ready" ? "Step 2 · Ready to invest" : "Execution blocked"}</h2></div><span className={executionPlan.executable ? "pill ok" : "pill"}>{executionPlan.executable ? "Checks passed" : "Fail closed"}</span></header><div className="call-list">{executionPlan.calls.map((call,index) => <div key={`${call.kind}-${index}`}><b>{index+1}. {call.label}</b><code>{call.to}</code></div>)}</div><div className="checks">{executionPlan.checks.map(check => <span key={check.name} className={check.passed ? "pass" : "fail"}>{check.passed ? "✓" : "×"} {check.name}{check.detail ? ` · ${check.detail}` : ""}</span>)}</div>{executionPlan.expiresAt && <p className="note">Firm 0x quote expires at {new Date(executionPlan.expiresAt).toLocaleTimeString()}.</p>}<button className="execute-button" onClick={executePlan} disabled={operationPending || !executionPlan.executable}>{executionPlan.phase === "allowance_required" ? "Approve exact USDC allowance" : "Confirm & invest"}</button><p className="note">Your CDP Smart Account submits this operation only after you approve it. The AI never signs transactions.</p></section>}
 
-    {pendingExecution && <section className="lifecycle-card pending"><div><p className="eyebrow">COINBASE USER OPERATION</p><h2>Waiting for the Base transaction.</h2><p>Coinbase is tracking the signed Smart Account operation. As soon as it produces the transaction hash, StockOS will persist it and the Railway worker takes over monitoring.</p></div><div className="lifecycle-side"><span className="status-dot">{sendStatus === "success" ? "Finalizing" : "Pending"}</span><code>{pendingExecution.userOperationHash.slice(0, 12)}…</code></div></section>}
+    {pendingExecution && <section className="lifecycle-card pending"><div><p className="eyebrow">COINBASE USER OPERATION</p><h2>Waiting for the Base transaction.</h2><p>Coinbase is tracking the signed Smart Account operation. As soon as it produces the transaction hash, StockOS will persist it and the Railway worker takes over monitoring.</p></div><div className="lifecycle-side"><span className="status-dot">{pendingExecution.handingOff ? "Handoff" : sendStatus === "success" ? "Finalizing" : "Pending"}</span><code>{pendingExecution.userOperationHash.slice(0, 12)}…</code></div></section>}
 
     {executionPending && <section className="lifecycle-card pending"><div><p className="eyebrow">EXECUTION</p><h2>Portfolio transaction is confirming.</h2><p>StockOS is watching Base independently of this browser. You can close the page and the worker will keep reconciling the receipt.</p></div><div className="lifecycle-side"><span className="status-dot">Confirming</span>{portfolioState?.execution?.transactionHash && <a href={`https://basescan.org/tx/${portfolioState.execution.transactionHash}`} target="_blank" rel="noreferrer">View on BaseScan</a>}</div></section>}
 
