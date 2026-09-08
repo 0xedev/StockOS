@@ -7,8 +7,11 @@ const STOCKS: SupportedAsset[] = ["NVDAc", "GOOGLc", "METAc", "AAPLc"];
 function redistributeFromCashOnly(intent: InvestmentIntent): InvestmentIntent {
   const onlyCash = intent.targetAllocations.length === 1 && intent.targetAllocations[0]?.asset === "USDC";
   const cashMinimum = Math.max(0, ...intent.constraints.filter(c => c.type === "MIN_CASH").map(c => c.value));
-  const hasStockConstraint = intent.constraints.some(c => c.type === "MAX_WEIGHT" && c.asset && c.asset !== "USDC");
-  const shouldDiversify = onlyCash && cashMinimum < 0.999 && (intent.risk !== "conservative" || hasStockConstraint);
+  // This repair is intentionally narrow: it only corrects the old parser bug where
+  // “at least N% cash” was mistaken for an explicit cash allocation and the remainder
+  // was then also filled with USDC. Explicit all-cash requests have no MIN_CASH
+  // constraint and must remain untouched.
+  const shouldDiversify = onlyCash && cashMinimum > 0 && cashMinimum < 0.999;
   if (!shouldDiversify) return intent;
 
   const available = STOCKS.filter(asset => !intent.exclusions.includes(asset));
