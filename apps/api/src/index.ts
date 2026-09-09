@@ -19,6 +19,68 @@ import { persistStrategyDraft } from "./lib/strategy-store.ts";
 const app = Fastify({ logger: true });
 const allowedOrigins = new Set((process.env.CORS_ORIGINS ?? "http://localhost:3000").split(",").map(value => value.trim()).filter(Boolean));
 const supportedByokProviders = new Set<ByokProvider>(["openai", "anthropic", "gemini", "openrouter"]);
+
+function mapExecutionProviderError(error: unknown) {
+  if (!(error instanceof Error)) return null;
+  const match = error.message.match(/^0x\s+(\d{3}):\s*(.*)$/i);
+  if (!match) return null;
+
+  const providerStatus = Number(match[1]);
+  const providerReason = match[2]?.trim() || "0x rejected the execution request";
+  const normalized = providerReason.toLowerCase();
+
+  if (providerStatus === 422 && normalized.includes("not authorized for trade")) {
+    return {
+      statusCode: 422,
+      body: {
+        error: "rwa_routing_not_enabled",
+        message: "Live tokenized-stock execution is not enabled for this StockOS 0x account yet. 0x rejected the RWA route before any transaction was created or funds were moved.",
+        action: "Enable tokenized-stock/RWA routing for the StockOS 0x API account, then retry execution.",
+        provider: "0x",
+        providerStatus,
+        retryable: false,
+      },
+    };
+  }
+
+  if (providerStatus === 429) {
+    return {
+      statusCode: 503,
+      body: {
+        error: "execution_provider_rate_limited",
+        message: "Live execution pricing is temporarily rate-limited by 0x. Your strategy is safe; retry shortly.",
+        provider: "0x",
+        providerStatus,
+        retryable: true,
+      },
+    };
+  }
+
+  if (providerStatus >= 500) {
+    return {
+      statusCode: 503,
+      body: {
+        error: "execution_provider_unavailable",
+        message: "0x is temporarily unavailable, so StockOS cannot prepare a safe execution plan right now. No transaction was created.",
+        provider: "0x",
+        providerStatus,
+        retryable: true,
+      },
+    };
+  }
+
+  return {
+    statusCode: 422,
+    body: {
+      error: "execution_quote_rejected",
+      message: `0x rejected the execution request: ${providerReason}`,
+      provider: "0x",
+      providerStatus,
+      retryable: false,
+    },
+  };
+}
+
 await app.register(cors, {
   origin(origin, callback) {
     if (!origin || allowedOrigins.has(origin)) return callback(null, true);
@@ -252,6 +314,11 @@ app.post("/v1/execution/prepare", async (request, reply) => {
   try { return await prepareExecution({ userId: session.profile.id, smartAccountAddress: session.wallet.smartAccountAddress, strategyVersionId: body.strategyVersionId }); }
   catch (error) {
     if (error instanceof ExecutionPreparationError) return reply.code(error.statusCode).send({ error: error.code, message: error.message });
+    const providerError = mapExecutionProviderError(error);
+    if (providerError) {
+      request.log.warn({ provider: "0x", status: providerError.body.providerStatus, code: providerError.body.error }, "execution provider rejected request");
+      return reply.code(providerError.statusCode).send(providerError.body);
+    }
     throw error;
   }
 });
@@ -270,8 +337,14 @@ app.post("/v1/execution/:planId/submitted", async (request, reply) => {
 });
 
 app.setErrorHandler((error, request, reply) => {
-  request.log.error({ err: error }, "request failed");
-  reply.code(500).send({ error: "internal_error" });
+  const requestId = String(request.id);
+  request.log.error({ err: error, requestId }, "request failed");
+  reply.code(500).send({
+    error: "internal_error",
+    message: `StockOS could not complete this request. Please retry. If it keeps failing, share reference ${requestId}.`,
+    requestId,
+    retryable: true,
+  });
 });
 
 const port = Number(process.env.PORT ?? 4000);
