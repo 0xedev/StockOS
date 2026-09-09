@@ -2,11 +2,13 @@ import { createHash } from "node:crypto";
 import type { CompiledStrategy, InvestmentIntent } from "../../../../packages/core/src/types.ts";
 import { getAdminSupabase } from "./db.ts";
 
+type RebalanceFrequency = NonNullable<InvestmentIntent["automation"]>["rebalance"];
+
 function sha256(value: string) {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function nextRebalanceAt(rebalance: InvestmentIntent["automation"]["rebalance"] | undefined): string | null {
+function nextRebalanceAt(rebalance: RebalanceFrequency | undefined): string | null {
   if (!rebalance || rebalance === "NONE") return null;
   const next = new Date();
   if (rebalance === "WEEKLY") next.setUTCDate(next.getUTCDate() + 7);
