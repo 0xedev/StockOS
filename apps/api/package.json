@@ -9,8 +9,10 @@
   },
   "dependencies": {
     "@coinbase/cdp-sdk": "latest",
+    "@dromos-labs/sdk.js": "0.3.0-alpha.3",
     "@fastify/cors": "latest",
     "@supabase/supabase-js": "latest",
+    "@wagmi/core": "^2.0.0",
     "fastify": "latest",
     "viem": "latest"
   },
