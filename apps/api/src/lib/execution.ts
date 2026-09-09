@@ -4,12 +4,15 @@ import { ASSETS } from "../../../../packages/b20/src/registry.ts";
 import type { CompiledStrategy, SupportedAsset } from "../../../../packages/core/src/types.ts";
 import { ZeroXClient, type ZeroXSwapResponse } from "../../../../packages/execution/src/zerox.ts";
 import { encodeExactApproval, readAllowance, readB20ReceiveSafety, readReferencePrice, readTokenBalance, readTokenDecimals } from "./chain.ts";
+import { getCdpSwapPriceProbe } from "./cdp-trade.ts";
 import { getAdminSupabase } from "./db.ts";
 import { loadOwnedStrategyVersion } from "./strategy-store.ts";
 
 const USDC = ASSETS.USDC.address!;
 const USDC_DECIMALS = 6;
 const QUOTE_TTL_MS = 25_000;
+
+type IndicativeProvider = "coinbase_cdp" | "0x";
 
 export class ExecutionPreparationError extends Error {
   constructor(public code: string, message: string, public statusCode = 400) { super(message); }
@@ -24,6 +27,7 @@ type PriceWork = {
   sellAmount: bigint;
   tokenAddress: string;
   response: ZeroXSwapResponse;
+  provider: IndicativeProvider;
   allowanceTarget: string | null;
   b20Safety: { transferPaused: boolean; receiverPolicyId: bigint; receiverAuthorized: boolean };
 };
@@ -38,12 +42,10 @@ function targetFrom(response: ZeroXSwapResponse): string | null {
   return target && isAddress(target) ? target : null;
 }
 
-function assertPriceResponse(response: ZeroXSwapResponse, asset: SupportedAsset) {
-  if (response.liquidityAvailable === false) throw new ExecutionPreparationError("liquidity_unavailable", `No 0x liquidity is available for ${asset}`, 409);
-  if (!response.buyAmount || BigInt(response.buyAmount) <= 0n) throw new ExecutionPreparationError("invalid_buy_amount", `0x returned no indicative buy amount for ${asset}`, 502);
-  // A /price response can legitimately report an insufficient balance while still
-  // providing useful live route/pricing data. Funding is evaluated after all price
-  // legs have been discovered so users can inspect the market before depositing.
+function assertPriceResponse(response: ZeroXSwapResponse, asset: SupportedAsset, provider: IndicativeProvider) {
+  const providerName = provider === "coinbase_cdp" ? "Coinbase CDP" : "0x";
+  if (response.liquidityAvailable === false) throw new ExecutionPreparationError("liquidity_unavailable", `No ${providerName} liquidity is available for ${asset}`, 409);
+  if (!response.buyAmount || BigInt(response.buyAmount) <= 0n) throw new ExecutionPreparationError("invalid_buy_amount", `${providerName} returned no indicative buy amount for ${asset}`, 502);
 }
 
 function assertFirmQuote(response: ZeroXSwapResponse, expectedTarget: string, asset: SupportedAsset) {
@@ -97,15 +99,81 @@ async function persistPlan(input: {
   return data.id as string;
 }
 
+async function getIndicativePrice(input: {
+  asset: SupportedAsset;
+  tokenAddress: string;
+  sellAmount: bigint;
+  smartAccountAddress: string;
+  zeroX: ZeroXClient | null;
+}): Promise<{ provider: IndicativeProvider; response: ZeroXSwapResponse }> {
+  let cdpFailure: unknown = null;
+  try {
+    const cdp = await getCdpSwapPriceProbe({
+      fromToken: USDC,
+      toToken: input.tokenAddress,
+      fromAmount: input.sellAmount,
+      taker: input.smartAccountAddress,
+      slippageBps: 50,
+    });
+    if (cdp.liquidityAvailable && cdp.toAmount && BigInt(cdp.toAmount) > 0n) {
+      return {
+        provider: "coinbase_cdp",
+        response: {
+          liquidityAvailable: true,
+          sellAmount: input.sellAmount.toString(),
+          buyAmount: cdp.toAmount,
+          minBuyAmount: cdp.minToAmount ?? undefined,
+          allowanceTarget: cdp.allowanceSpender ?? undefined,
+          issues: {
+            allowance: cdp.allowanceSpender ? { spender: cdp.allowanceSpender } : null,
+            balance: cdp.balanceIssue ? { token: USDC } : null,
+            simulationIncomplete: cdp.simulationIncomplete,
+          },
+          route: { provider: "coinbase_cdp_trade_api" },
+        },
+      };
+    }
+    cdpFailure = new Error(`Coinbase CDP reported no liquidity for ${input.asset}`);
+  } catch (error) {
+    cdpFailure = error;
+  }
+
+  if (input.zeroX) {
+    try {
+      const response = await input.zeroX.price({
+        sellToken: USDC,
+        buyToken: input.tokenAddress,
+        sellAmount: input.sellAmount.toString(),
+        taker: input.smartAccountAddress,
+        slippageBps: 50,
+      });
+      return { provider: "0x", response };
+    } catch (zeroXError) {
+      const cdpMessage = cdpFailure instanceof Error ? cdpFailure.message : "Coinbase CDP price discovery failed";
+      const zeroXMessage = zeroXError instanceof Error ? zeroXError.message : "0x price discovery failed";
+      throw new ExecutionPreparationError(
+        "execution_pricing_unavailable",
+        `Neither Coinbase CDP nor 0x could price ${input.asset}. Coinbase: ${cdpMessage}. 0x: ${zeroXMessage}`,
+        503,
+      );
+    }
+  }
+
+  throw new ExecutionPreparationError(
+    "cdp_trade_pricing_unavailable",
+    cdpFailure instanceof Error ? `Coinbase CDP could not price ${input.asset}: ${cdpFailure.message}` : `Coinbase CDP could not price ${input.asset}`,
+    503,
+  );
+}
+
 export async function prepareExecution(input: { userId: string; smartAccountAddress: string; strategyVersionId: string }) {
-  if (!process.env.ZEROX_API_KEY) throw new ExecutionPreparationError("zerox_not_configured", "0x is not configured", 503);
   const { version, strategy } = await loadOwnedStrategyVersion(input.userId, input.strategyVersionId);
   const compiled = version.compiled_strategy as CompiledStrategy;
   const stockAllocations = compiled.allocations.filter(allocation => allocation.asset !== "USDC" && allocation.amountUsd > 0);
   if (!stockAllocations.length) throw new ExecutionPreparationError("nothing_to_execute", "Strategy has no stock allocations");
 
   const priceWork: PriceWork[] = [];
-  const zeroX = new ZeroXClient(process.env.ZEROX_API_KEY);
+  const zeroX = process.env.ZEROX_API_KEY ? new ZeroXClient(process.env.ZEROX_API_KEY) : null;
   for (const allocation of stockAllocations) {
     const record = ASSETS[allocation.asset];
     if (!record?.enabled || !record.address) throw new ExecutionPreparationError("asset_not_verified", `${allocation.asset} is not enabled for execution`, 409);
@@ -119,15 +187,22 @@ export async function prepareExecution(input: { userId: string; smartAccountAddr
     }
 
     const sellAmount = usdcRaw(allocation.amountUsd);
-    const response = await zeroX.price({ sellToken: USDC, buyToken: record.address, sellAmount: sellAmount.toString(), taker: input.smartAccountAddress, slippageBps: 50 });
-    assertPriceResponse(response, allocation.asset);
+    const priced = await getIndicativePrice({
+      asset: allocation.asset,
+      tokenAddress: record.address,
+      sellAmount,
+      smartAccountAddress: input.smartAccountAddress,
+      zeroX,
+    });
+    assertPriceResponse(priced.response, allocation.asset, priced.provider);
     priceWork.push({
       asset: allocation.asset,
       allocationUsd: allocation.amountUsd,
       sellAmount,
       tokenAddress: record.address,
-      response,
-      allowanceTarget: targetFrom(response),
+      response: priced.response,
+      provider: priced.provider,
+      allowanceTarget: targetFrom(priced.response),
       b20Safety,
     });
   }
@@ -136,10 +211,12 @@ export async function prepareExecution(input: { userId: string; smartAccountAddr
   const totalPortfolioUsd = compiled.allocations.reduce((sum, allocation) => sum + Number(allocation.amountUsd ?? 0), 0);
   const requiredCapital = usdcRaw(totalPortfolioUsd);
   const balance = await readTokenBalance(USDC, input.smartAccountAddress);
+  const providers = [...new Set(priceWork.map(work => work.provider))];
+  const pricingProvider = providers.length === 1 ? providers[0] : "mixed";
   const b20Checks: PlanCheck[] = priceWork.flatMap(work => [
     { name: `b20_transfer_unpaused:${work.asset}`, passed: !work.b20Safety.transferPaused },
     { name: `b20_receiver_authorized:${work.asset}`, passed: work.b20Safety.receiverAuthorized, detail: `receiver policy ${work.b20Safety.receiverPolicyId.toString()}` },
-    { name: `zerox_liquidity:${work.asset}`, passed: true, detail: "Live 0x indicative pricing available" },
+    { name: `${work.provider === "coinbase_cdp" ? "cdp" : "zerox"}_liquidity:${work.asset}`, passed: true, detail: `Live ${work.provider === "coinbase_cdp" ? "Coinbase CDP" : "0x"} indicative pricing available` },
   ]);
 
   const indicativePricing = await Promise.all(priceWork.map(async work => {
@@ -148,6 +225,7 @@ export async function prepareExecution(input: { userId: string; smartAccountAddr
     const buyQuantity = Number(formatUnits(BigInt(buyAmount), tokenDecimals));
     return {
       asset: work.asset,
+      provider: work.provider,
       sellUsd: work.allocationUsd,
       buyAmount,
       tokenDecimals,
@@ -175,7 +253,8 @@ export async function prepareExecution(input: { userId: string; smartAccountAddr
       requiredStockSpend: totalSell.toString(),
       currentBalance: balance.toString(),
       fundingShortfall: fundingShortfall.toString(),
-      pricingType: "indicative_0x_price",
+      pricingProvider,
+      pricingType: pricingProvider === "coinbase_cdp" ? "indicative_cdp_price" : pricingProvider === "0x" ? "indicative_0x_price" : "indicative_multi_provider_price",
       pricing: indicativePricing,
       calls: [] as PlanCall[],
       executable: false,
@@ -185,6 +264,15 @@ export async function prepareExecution(input: { userId: string; smartAccountAddr
     return { planId, ...plan, checks };
   }
 
+  if (priceWork.some(work => work.provider === "coinbase_cdp")) {
+    throw new ExecutionPreparationError(
+      "cdp_trade_quote_adapter_pending",
+      "Coinbase CDP can price this B20 route. StockOS has not yet enabled the firm CDP quote/execution adapter, so no transaction was created.",
+      409,
+    );
+  }
+
+  if (!zeroX) throw new ExecutionPreparationError("zerox_not_configured", "0x is not configured for the fallback execution route", 503);
   const allowanceTargets = priceWork.map(work => work.allowanceTarget);
   if (allowanceTargets.some(target => !target)) {
     throw new ExecutionPreparationError("invalid_0x_allowance_target", "0x did not return a valid AllowanceHolder target", 502);
@@ -215,6 +303,7 @@ export async function prepareExecution(input: { userId: string; smartAccountAddr
       requiredCapital: requiredCapital.toString(),
       requiredAllowance: totalSell.toString(),
       currentAllowance: allowance.toString(),
+      pricingProvider: "0x",
       pricingType: "indicative_0x_price",
       pricing: indicativePricing,
       calls,
@@ -225,8 +314,6 @@ export async function prepareExecution(input: { userId: string; smartAccountAddr
   }
 
   const maxDeviationBps = Number(process.env.MAX_REFERENCE_DEVIATION_BPS ?? 200);
-  // Coinbase B20 Chainlink feeds can legitimately hold their last value outside equity sessions
-  // and have a 24h heartbeat. Production overrides this with a weekend/holiday-tolerant bound.
   const maxStaleness = Number(process.env.MAX_REFERENCE_STALENESS_SECONDS ?? 345600);
   const calls: PlanCall[] = [];
   const checks: PlanCheck[] = [
@@ -268,6 +355,7 @@ export async function prepareExecution(input: { userId: string; smartAccountAddr
     requiredCapital: requiredCapital.toString(),
     calls,
     quotes: quoteSummaries,
+    pricingProvider: "0x",
     pricingType: "firm_0x_quote",
     expiresAt,
     executable,
