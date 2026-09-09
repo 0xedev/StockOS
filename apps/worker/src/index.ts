@@ -167,21 +167,42 @@ async function activateStrategy(userId: string, strategyId: string, strategyVers
   const activatedAt = new Date();
   const now = activatedAt.toISOString();
   await db.from("strategies").update({ status: "paused", updated_at: now }).eq("user_id", userId).eq("status", "active").neq("id", strategyId);
-  await db.from("strategies").update({ status: "active", updated_at: now }).eq("id", strategyId);
+  const { error: strategyUpdateError } = await db.from("strategies").update({ status: "active", current_version: strategyVersion, updated_at: now }).eq("id", strategyId).eq("user_id", userId);
+  if (strategyUpdateError) throw new Error(`Could not activate strategy version: ${strategyUpdateError.message}`);
+
+  const { data: version, error: versionError } = await db
+    .from("strategy_versions")
+    .select("parsed_intent")
+    .eq("strategy_id", strategyId)
+    .eq("version", strategyVersion)
+    .maybeSingle();
+  if (versionError) throw new Error(`Could not load activated strategy intent: ${versionError.message}`);
+  const frequency = (version?.parsed_intent as any)?.automation?.rebalance;
 
   const { data: rebalanceRules, error: rulesError } = await db
     .from("automation_rules")
     .select("id,parameters")
     .eq("strategy_id", strategyId)
     .eq("rule_type", "scheduled_rebalance")
-    .eq("enabled", true);
+    .order("created_at", { ascending: false });
   if (rulesError) throw new Error(`Could not load rebalance rules: ${rulesError.message}`);
-  for (const rule of rebalanceRules ?? []) {
-    const frequency = (rule.parameters as any)?.frequency;
-    const nextRunAt = nextRebalanceFrom(frequency, activatedAt);
-    if (!nextRunAt) continue;
-    const { error } = await db.from("automation_rules").update({ next_run_at: nextRunAt, updated_at: now }).eq("id", rule.id);
-    if (error) throw new Error(`Could not schedule rebalance from activation: ${error.message}`);
+
+  const nextRunAt = nextRebalanceFrom(frequency, activatedAt);
+  const existingRule = rebalanceRules?.[0] ?? null;
+  if (nextRunAt) {
+    const parameters = { frequency, mode: "user_approval_required", source: "strategy_intent" };
+    if (existingRule) {
+      const { error } = await db.from("automation_rules").update({ parameters, enabled: true, next_run_at: nextRunAt, updated_at: now }).eq("id", existingRule.id);
+      if (error) throw new Error(`Could not schedule rebalance from activation: ${error.message}`);
+      const staleIds = (rebalanceRules ?? []).slice(1).map(rule => rule.id);
+      if (staleIds.length) await db.from("automation_rules").update({ enabled: false, updated_at: now }).in("id", staleIds);
+    } else {
+      const { error } = await db.from("automation_rules").insert({ strategy_id: strategyId, rule_type: "scheduled_rebalance", parameters, enabled: true, next_run_at: nextRunAt });
+      if (error) throw new Error(`Could not create rebalance schedule: ${error.message}`);
+    }
+  } else if (rebalanceRules?.length) {
+    const { error } = await db.from("automation_rules").update({ enabled: false, updated_at: now }).in("id", rebalanceRules.map(rule => rule.id));
+    if (error) throw new Error(`Could not disable rebalance schedule: ${error.message}`);
   }
 
   await db.from("audit_events").insert({

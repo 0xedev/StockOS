@@ -1,5 +1,5 @@
 import {
-  base,
+  base as aerodromeBase,
   getDefaultConfig,
   swap,
   type Quote,
@@ -16,6 +16,7 @@ import {
   zeroAddress,
   type Address,
 } from "viem";
+import { base as viemBase } from "viem/chains";
 
 const BASE_CHAIN_ID = 8453;
 
@@ -67,13 +68,27 @@ const QUOTER_ABI = [
 
 type AerodromeConfig = ReturnType<typeof getDefaultConfig>;
 let cachedConfig: AerodromeConfig | null = null;
-let cachedClient: ReturnType<typeof createPublicClient> | null = null;
 
 function configuredRpcUrl(): string {
   const rpcUrl = process.env.BASE_RPC_URL?.trim();
   if (!rpcUrl) throw new Error("BASE_RPC_URL is required for Aerodrome routing");
   return rpcUrl;
 }
+
+function createRpcClient() {
+  return createPublicClient({
+    chain: viemBase,
+    transport: http(configuredRpcUrl(), {
+      batch: true,
+      retryCount: 2,
+      retryDelay: 150,
+      timeout: 12_000,
+    }),
+  });
+}
+
+type RpcClient = ReturnType<typeof createRpcClient>;
+let cachedClient: RpcClient | null = null;
 
 function rpcLabel(): string {
   try {
@@ -83,25 +98,15 @@ function rpcLabel(): string {
   }
 }
 
-function getClient() {
-  if (!cachedClient) {
-    cachedClient = createPublicClient({
-      chain: base,
-      transport: http(configuredRpcUrl(), {
-        batch: true,
-        retryCount: 2,
-        retryDelay: 150,
-        timeout: 12_000,
-      }),
-    });
-  }
+function getClient(): RpcClient {
+  if (!cachedClient) cachedClient = createRpcClient();
   return cachedClient;
 }
 
 function getAerodromeConfig(): AerodromeConfig {
   if (!cachedConfig) {
     const config = getDefaultConfig({
-      chains: [{ chain: base, rpcUrl: configuredRpcUrl() }],
+      chains: [{ chain: aerodromeBase, rpcUrl: configuredRpcUrl() }],
     });
     const baseChainConfig = config.sugarConfig.chains.find(chain => chain.CHAIN.id === BASE_CHAIN_ID);
     if (!baseChainConfig) throw new Error("Aerodrome Base configuration is unavailable");

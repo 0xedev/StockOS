@@ -24,9 +24,14 @@ const aggregatorAbi = parseAbi([
   "function latestRoundData() view returns (uint80 roundId,int256 answer,uint256 startedAt,uint256 updatedAt,uint80 answeredInRound)",
 ]);
 
-let client: ReturnType<typeof createPublicClient> | null = null;
-export function getBaseClient() {
-  if (!client) client = createPublicClient({ chain: base, transport: http(process.env.BASE_RPC_URL ?? "https://mainnet.base.org") });
+function createBaseClient() {
+  return createPublicClient({ chain: base, transport: http(process.env.BASE_RPC_URL ?? "https://mainnet.base.org") });
+}
+
+type BaseClient = ReturnType<typeof createBaseClient>;
+let client: BaseClient | null = null;
+export function getBaseClient(): BaseClient {
+  if (!client) client = createBaseClient();
   return client;
 }
 
@@ -76,9 +81,6 @@ export type B20ReceiveSafety = {
   receiverAuthorized: boolean;
 };
 
-// StockOS currently prepares BUY flows, so the user Smart Account is the B20 transfer receiver.
-// 0x simulation still validates the complete route; this explicit read catches receiver-policy and
-// token pause failures before we ever present a firm quote for approval.
 export async function readB20ReceiveSafety(token: string, receiver: string): Promise<B20ReceiveSafety> {
   const tokenAddress = address(token, "B20 token");
   const receiverAddress = address(receiver, "receiver");
