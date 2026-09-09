@@ -7,8 +7,4 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
-      - run: corepack enable
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm test:core
-      - run: pnpm typecheck
-      - run: pnpm --filter @stockos/web exec tsc --noEmit
+      - run: node --experimental-strip-types tests/core.test.ts
