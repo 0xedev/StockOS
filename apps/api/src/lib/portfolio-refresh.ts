@@ -6,6 +6,8 @@ import { getAdminSupabase } from "./db.ts";
 
 const TRACKED_ASSETS: SupportedAsset[] = ["USDC", "AAPLc", "GOOGLc", "METAc", "NVDAc"];
 
+type TargetRow = { asset_symbol: string; target_weight: number | string };
+
 export async function capturePortfolioSnapshotNow(input: {
   userId: string;
   smartAccountAddress: string;
@@ -49,7 +51,9 @@ export async function capturePortfolioSnapshotNow(input: {
     .select("asset_symbol,target_weight")
     .eq("strategy_version_id", version.id);
   if (targetError) throw new Error(`Could not load target weights: ${targetError.message}`);
-  const targets = new Map((targetRows ?? []).map(row => [row.asset_symbol as SupportedAsset, Number(row.target_weight)]));
+  const targets = new Map<SupportedAsset, number>(
+    ((targetRows ?? []) as TargetRow[]).map(row => [row.asset_symbol as SupportedAsset, Number(row.target_weight)]),
+  );
 
   const positions: Array<{
     asset: SupportedAsset;
@@ -66,15 +70,17 @@ export async function capturePortfolioSnapshotNow(input: {
 
   for (const asset of TRACKED_ASSETS) {
     const record = ASSETS[asset];
-    if (!record?.enabled || !record.address) continue;
-    const [balance, decimals, reference] = await Promise.all([
+    if (!record.enabled || !record.address) continue;
+    const [balance, reference] = await Promise.all([
       readTokenBalance(record.address, input.smartAccountAddress),
-      record.decimals == null ? readTokenDecimals(record.address) : Promise.resolve(record.decimals),
       readReferencePrice(asset),
     ]);
-    const tokenUnits = Number(formatUnits(balance, Number(decimals)));
-    const priceUsd = reference.configured && Number.isFinite(reference.priceUsd) ? Number(reference.priceUsd) : null;
-    const valueUsd = priceUsd == null ? null : tokenUnits * priceUsd;
+    const decimals: number = record.decimals ?? await readTokenDecimals(record.address);
+    const tokenUnits = Number(formatUnits(balance, decimals));
+    const priceUsd: number | null = reference.configured && typeof reference.priceUsd === "number" && Number.isFinite(reference.priceUsd)
+      ? reference.priceUsd
+      : null;
+    const valueUsd: number | null = priceUsd == null ? null : tokenUnits * priceUsd;
     positions.push({
       asset,
       rawBalance: balance.toString(),
@@ -82,20 +88,21 @@ export async function capturePortfolioSnapshotNow(input: {
       priceUsd,
       priceUpdatedAt: reference.updatedAt ?? null,
       valueUsd,
-      targetWeight: targets.get(asset) ?? 0,
+      targetWeight: Number(targets.get(asset) ?? 0),
     });
   }
 
   const totalValueUsd = positions.reduce((sum, position) => sum + (position.valueUsd ?? 0), 0);
   for (const position of positions) {
     const currentWeight = totalValueUsd > 0 && position.valueUsd != null ? position.valueUsd / totalValueUsd : 0;
+    const drift = currentWeight - position.targetWeight;
     position.currentWeight = currentWeight;
-    position.drift = currentWeight - position.targetWeight;
-    position.absoluteDrift = Math.abs(position.drift);
+    position.drift = drift;
+    position.absoluteDrift = Math.abs(drift);
   }
 
   const blockNumber = await getBaseClient().getBlockNumber();
-  const cashValueUsd = positions.find(position => position.asset === "USDC")?.valueUsd ?? 0;
+  const cashValueUsd = Number(positions.find(position => position.asset === "USDC")?.valueUsd ?? 0);
   const capturedAt = new Date().toISOString();
   const { error: insertError } = await db.from("portfolio_snapshots").insert({
     user_id: input.userId,
