@@ -17,6 +17,17 @@ function amountToString(value: unknown): string | null {
   return null;
 }
 
+function safeTradeError(error: unknown) {
+  if (!(error instanceof Error)) return { message: "Unknown CDP Trade API failure" };
+  const anyError = error as any;
+  return {
+    name: error.name,
+    message: error.message,
+    status: anyError?.status ?? anyError?.statusCode ?? anyError?.response?.status ?? null,
+    code: anyError?.code ?? anyError?.error?.code ?? null,
+  };
+}
+
 /**
  * Non-destructive Coinbase CDP Trade API price discovery.
  * This calls getSwapPrice only; it does not create a firm quote, sign, or submit a transaction.
@@ -29,14 +40,28 @@ export async function getCdpSwapPriceProbe(input: {
   slippageBps?: number;
 }): Promise<CdpSwapPriceProbe> {
   const cdp = getCdpClient();
-  const result = await cdp.evm.getSwapPrice({
-    network: "base",
-    fromToken: input.fromToken as `0x${string}`,
-    toToken: input.toToken as `0x${string}`,
-    fromAmount: input.fromAmount,
-    taker: input.taker as `0x${string}`,
-    slippageBps: input.slippageBps ?? 50,
-  });
+  let result: unknown;
+  try {
+    result = await cdp.evm.getSwapPrice({
+      network: "base",
+      fromToken: input.fromToken as `0x${string}`,
+      toToken: input.toToken as `0x${string}`,
+      fromAmount: input.fromAmount,
+      taker: input.taker as `0x${string}`,
+      slippageBps: input.slippageBps ?? 50,
+    });
+  } catch (error) {
+    // Safe observability only: no credentials, auth headers, or response bodies are logged.
+    console.warn("cdp_trade_price_probe_failed", {
+      ...safeTradeError(error),
+      network: "base",
+      fromToken: input.fromToken,
+      toToken: input.toToken,
+      fromAmount: input.fromAmount.toString(),
+      taker: input.taker,
+    });
+    throw error;
+  }
 
   const raw = result as any;
   return {
