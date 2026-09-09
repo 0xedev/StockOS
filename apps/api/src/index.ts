@@ -6,15 +6,18 @@ import { parseIntentWithOpenRouterCompatible } from "../../../packages/ai/src/op
 import { parseIntentWithProvider, type ByokProvider } from "../../../packages/ai/src/providers.ts";
 import { deterministicIntentV3 } from "../../../packages/ai/src/deterministic-v3.ts";
 import { ASSETS } from "../../../packages/b20/src/registry.ts";
+import type { InvestmentIntent } from "../../../packages/core/src/types.ts";
 import { compileStrategy } from "../../../packages/strategy/src/compiler.ts";
 import { evaluatePolicy } from "../../../packages/policy/src/engine.ts";
 import { getAiSettings, resolveAiRuntime, saveByok, switchToManagedAi } from "./lib/ai-runtime.ts";
 import { assertEvmAddress, encodeTokenTransfer, readNativeBalance, readTokenBalance } from "./lib/chain.ts";
 import { ExecutionPreparationError, markPlanSubmitted, prepareExecution } from "./lib/execution.ts";
 import { createOnrampBuyQuote, getOnrampBuyOptions, OnrampRequestError } from "./lib/onramp.ts";
+import { capturePortfolioSnapshotNow } from "./lib/portfolio-refresh.ts";
 import { getPortfolioState } from "./lib/portfolio.ts";
+import { prepareRebalanceExecution, shouldPrepareRebalance } from "./lib/rebalance-execution.ts";
 import { requireStockOsSession } from "./lib/session.ts";
-import { persistStrategyDraft } from "./lib/strategy-store.ts";
+import { getActiveStrategyContext, persistStrategyAmendment, persistStrategyDraft } from "./lib/strategy-store.ts";
 
 const app = Fastify({ logger: true });
 const allowedOrigins = new Set((process.env.CORS_ORIGINS ?? "http://localhost:3000").split(",").map(value => value.trim()).filter(Boolean));
@@ -81,6 +84,62 @@ function mapExecutionProviderError(error: unknown) {
   };
 }
 
+async function interpretStrategyPrompt(input: {
+  userId: string;
+  prompt: string;
+  log: typeof app.log;
+}) {
+  const runtime = await resolveAiRuntime(input.userId);
+  let intent: InvestmentIntent;
+  let effectiveModel = runtime.model;
+  let effectiveSource: string = runtime.source;
+  let fallbackReason: string | null = null;
+
+  try {
+    if (runtime.apiKey) {
+      const parsed = runtime.source === "managed"
+        ? await parseIntentWithOpenRouterCompatible(input.prompt, runtime.apiKey, runtime.model)
+        : await parseIntentWithProvider({ provider: runtime.provider as ByokProvider, prompt: input.prompt, apiKey: runtime.apiKey, model: runtime.model });
+      intent = parsed.intent;
+      effectiveModel = parsed.model;
+    } else {
+      intent = deterministicIntentV3(input.prompt);
+      effectiveSource = "deterministic_demo";
+      effectiveModel = "deterministic-parser-v3";
+    }
+  } catch (error) {
+    if (error instanceof OpenRouterRequestError && runtime.source === "managed") {
+      try {
+        intent = deterministicIntentV3(input.prompt);
+        effectiveSource = "deterministic_fallback";
+        effectiveModel = "deterministic-parser-v3";
+        fallbackReason = `${error.status}:${error.message}`;
+        input.log.warn({ status: error.status, reason: error.message, requestedModel: runtime.model }, "managed AI unavailable; deterministic parser used");
+      } catch (fallbackError) {
+        const failure = new Error(fallbackError instanceof Error ? fallbackError.message : "Could not interpret this strategy") as Error & { statusCode?: number; code?: string };
+        failure.statusCode = 503;
+        failure.code = "strategy_interpretation_failed";
+        throw failure;
+      }
+    } else if (error instanceof OpenRouterRequestError) {
+      const failure = new Error(
+        error.status === 429 ? "Your selected AI model is currently rate-limited or at capacity." :
+        error.status === 504 ? "Your selected AI model did not respond before StockOS's timeout." :
+        "The selected AI provider could not produce a valid strategy.",
+      ) as Error & { statusCode?: number; code?: string; provider?: string; requestedModel?: string };
+      failure.statusCode = error.status === 429 ? 429 : error.status === 504 ? 504 : 503;
+      failure.code = error.status === 429 ? "ai_capacity_limited" : error.status === 504 ? "ai_timeout" : "ai_provider_unavailable";
+      failure.provider = runtime.provider;
+      failure.requestedModel = runtime.model;
+      throw failure;
+    } else {
+      throw error;
+    }
+  }
+
+  return { intent, effectiveModel, effectiveSource, fallbackReason, runtime };
+}
+
 await app.register(cors, {
   origin(origin, callback) {
     if (!origin || allowedOrigins.has(origin)) return callback(null, true);
@@ -101,6 +160,21 @@ app.post("/v1/session", async (request, reply) => {
 app.get("/v1/portfolio/active", async (request, reply) => {
   const session = await requireStockOsSession(request, reply);
   if (!session) return;
+  return getPortfolioState(session.profile.id);
+});
+
+app.post("/v1/portfolio/refresh", async (request, reply) => {
+  const session = await requireStockOsSession(request, reply);
+  if (!session) return;
+  if (!session.wallet.smartAccountAddress) return reply.code(409).send({ error: "smart_account_required", message: "Smart Account is not ready yet." });
+  const active = await getActiveStrategyContext(session.profile.id);
+  if (!active) return reply.code(409).send({ error: "active_strategy_required", message: "There is no active portfolio to refresh." });
+  await capturePortfolioSnapshotNow({
+    userId: session.profile.id,
+    smartAccountAddress: session.wallet.smartAccountAddress,
+    strategyId: active.strategy.id,
+    strategyVersion: active.strategy.current_version,
+  });
   return getPortfolioState(session.profile.id);
 });
 
@@ -251,58 +325,86 @@ app.post("/v1/strategy/compile", async (request, reply) => {
   const body = (request.body ?? {}) as { prompt?: string };
   if (!body.prompt?.trim()) return reply.code(400).send({ error: "prompt_required" });
   const prompt = body.prompt.trim();
-  const runtime = await resolveAiRuntime(session.profile.id);
 
-  let intent;
-  let effectiveModel = runtime.model;
-  let effectiveSource: string = runtime.source;
-  let fallbackReason: string | null = null;
   try {
-    if (runtime.apiKey) {
-      const parsed = runtime.source === "managed"
-        ? await parseIntentWithOpenRouterCompatible(prompt, runtime.apiKey, runtime.model)
-        : await parseIntentWithProvider({ provider: runtime.provider as ByokProvider, prompt, apiKey: runtime.apiKey, model: runtime.model });
-      intent = parsed.intent;
-      effectiveModel = parsed.model;
-    } else {
-      intent = deterministicIntentV3(prompt);
-      effectiveSource = "deterministic_demo";
-      effectiveModel = "deterministic-parser-v3";
-    }
+    const interpreted = await interpretStrategyPrompt({ userId: session.profile.id, prompt, log: request.log });
+    const strategy = compileStrategy(interpreted.intent);
+    if (interpreted.fallbackReason) strategy.warnings.push("Managed AI was unavailable, so StockOS used the deterministic parser. Exact percentages and named assets are preserved; review the result before proceeding.");
+    const policy = evaluatePolicy(interpreted.intent, strategy, { maxSlippageBps: 100, requestedSlippageBps: 50 });
+    const draft = await persistStrategyDraft({ userId: session.profile.id, prompt, intent: interpreted.intent, strategy, aiSource: interpreted.effectiveSource, aiModel: interpreted.effectiveModel });
+    return {
+      intent: interpreted.intent,
+      strategy,
+      policy,
+      draft,
+      ai: { source: interpreted.effectiveSource, model: interpreted.effectiveModel, requestedModel: interpreted.runtime.model, fallbackReason: interpreted.fallbackReason },
+      session: { smartAccountAddress: session.wallet.smartAccountAddress },
+    };
   } catch (error) {
-    if (error instanceof OpenRouterRequestError && runtime.source === "managed") {
-      try {
-        intent = deterministicIntentV3(prompt);
-        effectiveSource = "deterministic_fallback";
-        effectiveModel = "deterministic-parser-v3";
-        fallbackReason = `${error.status}:${error.message}`;
-        request.log.warn({ status: error.status, reason: error.message, requestedModel: runtime.model }, "managed AI unavailable; deterministic parser used");
-      } catch (fallbackError) {
-        return reply.code(503).send({ error: "strategy_interpretation_failed", message: fallbackError instanceof Error ? fallbackError.message : "Could not interpret this strategy", requestedModel: runtime.model });
-      }
-    } else if (error instanceof OpenRouterRequestError) {
-      const statusCode = error.status === 429 ? 429 : error.status === 504 ? 504 : 503;
-      return reply.code(statusCode).send({
-        error: error.status === 429 ? "ai_capacity_limited" : error.status === 504 ? "ai_timeout" : "ai_provider_unavailable",
-        message: error.status === 429 ? "Your selected AI model is currently rate-limited or at capacity." : error.status === 504 ? "Your selected AI model did not respond before StockOS's timeout." : "The selected AI provider could not produce a valid strategy.",
-        provider: runtime.provider,
-        requestedModel: runtime.model,
-      });
-    } else { throw error; }
+    const failure = error as Error & { statusCode?: number; code?: string; provider?: string; requestedModel?: string };
+    if (failure.statusCode) return reply.code(failure.statusCode).send({ error: failure.code ?? "strategy_interpretation_failed", message: failure.message, provider: failure.provider, requestedModel: failure.requestedModel });
+    throw error;
   }
+});
 
-  const strategy = compileStrategy(intent);
-  if (fallbackReason) strategy.warnings.push("Managed AI was unavailable, so StockOS used the deterministic parser. Exact percentages and named assets are preserved; review the result before proceeding.");
-  const policy = evaluatePolicy(intent, strategy, { maxSlippageBps: 100, requestedSlippageBps: 50 });
-  const draft = await persistStrategyDraft({ userId: session.profile.id, prompt, intent, strategy, aiSource: effectiveSource, aiModel: effectiveModel });
-  return {
-    intent,
-    strategy,
-    policy,
-    draft,
-    ai: { source: effectiveSource, model: effectiveModel, requestedModel: runtime.model, fallbackReason },
-    session: { smartAccountAddress: session.wallet.smartAccountAddress },
-  };
+app.post("/v1/strategy/adjust", async (request, reply) => {
+  const session = await requireStockOsSession(request, reply);
+  if (!session) return;
+  if (!session.wallet.smartAccountAddress) return reply.code(409).send({ error: "smart_account_required", message: "Smart Account is not ready yet." });
+  const body = (request.body ?? {}) as { prompt?: string };
+  if (!body.prompt?.trim()) return reply.code(400).send({ error: "prompt_required" });
+
+  const active = await getActiveStrategyContext(session.profile.id);
+  if (!active) return reply.code(409).send({ error: "active_strategy_required", message: "Start a portfolio before adjusting it." });
+
+  const fresh = await capturePortfolioSnapshotNow({
+    userId: session.profile.id,
+    smartAccountAddress: session.wallet.smartAccountAddress,
+    strategyId: active.strategy.id,
+    strategyVersion: active.strategy.current_version,
+  });
+  const currentStrategy = active.version.compiled_strategy as { allocations?: Array<{ asset: string; weight: number }> };
+  const currentAllocations = (currentStrategy.allocations ?? []).map(allocation => `${allocation.asset} ${(allocation.weight * 100).toFixed(2)}%`).join(", ");
+  const prompt = body.prompt.trim();
+  const contextualPrompt = [
+    `Update the user's EXISTING portfolio, not a new portfolio.`,
+    `Current portfolio value: $${fresh.totalValueUsd.toFixed(2)} USDC-equivalent.`,
+    `Current target allocations: ${currentAllocations || "unknown"}.`,
+    `The action must be UPDATE_PORTFOLIO. Keep capital at exactly ${fresh.totalValueUsd.toFixed(2)} unless the user explicitly asks to add or withdraw capital.`,
+    `User requested adjustment: ${prompt}`,
+    `Return a complete target allocation summing to 100%, including unchanged assets and USDC cash.`,
+  ].join("\n");
+
+  try {
+    const interpreted = await interpretStrategyPrompt({ userId: session.profile.id, prompt: contextualPrompt, log: request.log });
+    interpreted.intent.action = "UPDATE_PORTFOLIO";
+    interpreted.intent.capital = { currency: "USDC", amount: Number(fresh.totalValueUsd.toFixed(2)) };
+    const strategy = compileStrategy(interpreted.intent);
+    if (interpreted.fallbackReason) strategy.warnings.push("Managed AI was unavailable, so StockOS used the deterministic parser. Review the proposed adjustment carefully before execution.");
+    const policy = evaluatePolicy(interpreted.intent, strategy, { maxSlippageBps: 100, requestedSlippageBps: 50 });
+    const draft = await persistStrategyAmendment({
+      userId: session.profile.id,
+      prompt,
+      intent: interpreted.intent,
+      strategy,
+      aiSource: interpreted.effectiveSource,
+      aiModel: interpreted.effectiveModel,
+    });
+    return {
+      intent: interpreted.intent,
+      strategy,
+      policy,
+      draft,
+      amendment: true,
+      current: { strategyId: active.strategy.id, version: active.strategy.current_version, totalValueUsd: fresh.totalValueUsd },
+      ai: { source: interpreted.effectiveSource, model: interpreted.effectiveModel, requestedModel: interpreted.runtime.model, fallbackReason: interpreted.fallbackReason },
+      session: { smartAccountAddress: session.wallet.smartAccountAddress },
+    };
+  } catch (error) {
+    const failure = error as Error & { statusCode?: number; code?: string; provider?: string; requestedModel?: string };
+    if (failure.statusCode) return reply.code(failure.statusCode).send({ error: failure.code ?? "strategy_interpretation_failed", message: failure.message, provider: failure.provider, requestedModel: failure.requestedModel });
+    throw error;
+  }
 });
 
 app.post("/v1/execution/prepare", async (request, reply) => {
@@ -311,7 +413,12 @@ app.post("/v1/execution/prepare", async (request, reply) => {
   if (!session.wallet.smartAccountAddress) return reply.code(409).send({ error: "smart_account_required", message: "CDP Smart Account is not ready yet." });
   const body = (request.body ?? {}) as { strategyVersionId?: string };
   if (!body.strategyVersionId) return reply.code(400).send({ error: "strategy_version_required" });
-  try { return await prepareExecution({ userId: session.profile.id, smartAccountAddress: session.wallet.smartAccountAddress, strategyVersionId: body.strategyVersionId }); }
+  try {
+    const isRebalance = await shouldPrepareRebalance({ userId: session.profile.id, strategyVersionId: body.strategyVersionId });
+    return isRebalance
+      ? await prepareRebalanceExecution({ userId: session.profile.id, smartAccountAddress: session.wallet.smartAccountAddress, strategyVersionId: body.strategyVersionId })
+      : await prepareExecution({ userId: session.profile.id, smartAccountAddress: session.wallet.smartAccountAddress, strategyVersionId: body.strategyVersionId });
+  }
   catch (error) {
     if (error instanceof ExecutionPreparationError) return reply.code(error.statusCode).send({ error: error.code, message: error.message });
     const providerError = mapExecutionProviderError(error);
