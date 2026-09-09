@@ -3,7 +3,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
+    "build": "pnpm --filter @stockos/api typecheck && pnpm --filter @stockos/worker typecheck && tsc --noEmit && next build",
     "start": "next start"
   },
   "dependencies": {
