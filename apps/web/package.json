@@ -3,7 +3,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
+    "build": "npm install --prefix ../api && npm install --prefix ../worker && npm --prefix ../api run typecheck && npm --prefix ../worker run typecheck && tsc --noEmit && next build",
     "start": "next start"
   },
   "dependencies": {
