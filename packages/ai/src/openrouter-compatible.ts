@@ -11,18 +11,31 @@ targetAllocations must sum to exactly 1. Preserve exact percentages when the use
 
 const TIMEOUT_MS = 15_000;
 
+function normalizeContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.map(part => {
+    if (typeof part === "string") return part;
+    if (part && typeof part === "object" && "text" in part && typeof part.text === "string") {
+      return part.text;
+    }
+    return "";
+  }).join("");
+}
+
 function parseJsonIntent(content: unknown): InvestmentIntent {
-  if (typeof content !== "string" || !content.trim()) {
-    throw new OpenRouterRequestError(502, "OpenRouter returned an empty strategy response");
+  const normalized = normalizeContent(content);
+  if (!normalized.trim()) {
+    throw new OpenRouterRequestError(502, "Managed AI returned an empty strategy response");
   }
-  const trimmed = content.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
+  const trimmed = normalized.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
   const first = trimmed.indexOf("{");
   const last = trimmed.lastIndexOf("}");
   const candidate = first >= 0 && last > first ? trimmed.slice(first, last + 1) : trimmed;
   try {
     return validateInvestmentIntent(JSON.parse(candidate));
   } catch (error) {
-    throw new OpenRouterRequestError(502, `OpenRouter returned an invalid strategy: ${error instanceof Error ? error.message : "invalid JSON"}`);
+    throw new OpenRouterRequestError(502, `Managed AI returned an invalid strategy: ${error instanceof Error ? error.message : "invalid JSON"}`);
   }
 }
 
@@ -43,7 +56,11 @@ export async function parseIntentWithOpenRouterCompatible(prompt: string, apiKey
         models,
         temperature: 0,
         max_tokens: 1200,
-        provider: { allow_fallbacks: true },
+        stream: false,
+        // Do not let a provider silently ignore JSON mode. If the requested model/provider
+        // cannot honor it, OpenRouter can move to another compatible provider/model.
+        provider: { allow_fallbacks: true, require_parameters: true },
+        response_format: { type: "json_object" },
         messages: [
           { role: "system", content: SYSTEM },
           { role: "user", content: prompt },
@@ -52,18 +69,18 @@ export async function parseIntentWithOpenRouterCompatible(prompt: string, apiKey
     });
   } catch (error) {
     const timedOut = error instanceof DOMException && error.name === "TimeoutError";
-    throw new OpenRouterRequestError(504, timedOut ? "OpenRouter strategy parsing timed out" : "OpenRouter network request failed");
+    throw new OpenRouterRequestError(504, timedOut ? "Managed AI strategy parsing timed out" : "Managed AI network request failed");
   }
 
   let body: any;
   try {
     body = await response.json();
   } catch {
-    throw new OpenRouterRequestError(502, "OpenRouter returned a non-JSON response");
+    throw new OpenRouterRequestError(502, "Managed AI returned a non-JSON response envelope");
   }
 
   if (!response.ok) {
-    throw new OpenRouterRequestError(response.status, body?.error?.message ?? "OpenRouter request failed", body?.error?.code);
+    throw new OpenRouterRequestError(response.status, body?.error?.message ?? "Managed AI request failed", body?.error?.code);
   }
 
   return {
